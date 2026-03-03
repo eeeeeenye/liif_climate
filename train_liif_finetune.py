@@ -35,7 +35,62 @@ import datasets
 import models
 import utils
 from test import eval_psnr
+import torch.nn.functional as F
+from torch.utils.data._utils.collate import default_collate
 
+# 가장 큰 샘플 길이를 따라감
+def pad_collate(batch):
+    lengths = [b['coord'].shape[0] for b in batch]
+    max_len = max(lengths)
+
+    if max_len == 0:
+        return None
+
+    padded_inp = []
+    padded_gt = []
+    padded_coord=[]
+    padded_cell = []
+    padded_level=[]
+    padded_area = []
+    masks = []
+
+    for b, q in zip(batch, lengths):
+        inp = b['inp']
+        gt = b['gt']
+        coord = b['coord']
+        cell = b['cell']
+        level = b['level']
+        # area = b['area']
+        # print(area.shape, coord.shape)
+        pad_len = max_len-q
+
+        coord_padded = F.pad(coord, (0,0,0,pad_len))
+        gt_padded = F.pad(gt, (0, 0, 0, pad_len))
+        cell_padded = F.pad(cell, (0, 0, 0, pad_len)) 
+        # area_padded = F.pad(area, (0, 0, 0, pad_len), value=0.0)
+
+        mask = torch.zeros(max_len, dtype=torch.float32)
+        mask[:q] = 1.0
+
+        padded_inp.append(inp)
+        padded_gt.append(gt_padded)
+        padded_coord.append(coord_padded)
+        padded_cell.append(cell_padded)
+        padded_level.append(level)
+        # padded_area.append(area_padded)
+        masks.append(mask)
+    
+    batch_out = {
+            'inp' : torch.stack(padded_inp, dim=0),
+            'gt' : torch.stack(padded_gt, dim=0),
+            'coord': torch.stack(padded_coord, dim=0),
+            'cell': torch.stack(padded_cell, dim=0),
+            'level': torch.stack(padded_level, dim=0),
+            'mask': torch.stack(masks, dim=0),
+            # 'area': torch.stack(padded_area, dim=0)
+        }
+
+    return batch_out
 
 def make_data_loader(spec, tag=''):
     if spec is None:
@@ -48,8 +103,13 @@ def make_data_loader(spec, tag=''):
     for k, v in dataset[0].items():
         log('  {}: shape={}'.format(k, tuple(v.shape)))
 
-    loader = DataLoader(dataset, batch_size=spec['batch_size'],
-        shuffle=(tag == 'train'), num_workers=8, pin_memory=True)
+    loader = DataLoader(
+        dataset, 
+        batch_size=spec['batch_size'],
+        shuffle=(tag == 'train'), 
+        num_workers=8, 
+        pin_memory=True,
+        collate_fn=pad_collate)
     return loader
 
 
@@ -58,20 +118,19 @@ def make_data_loaders():
     val_loader = make_data_loader(config.get('val_dataset'), tag='val')
     return train_loader, val_loader
 
-
 def prepare_training():
     if config.get('resume') is not None:
         sv_file = torch.load(config['resume'])
         model = models.make(sv_file['model'], load_sd=True).cuda()
         optimizer = utils.make_optimizer(
-            model.parameters(), sv_file['optimizer'], load_sd=True)
+            model.parameters(), config['optimizer'])
         epoch_start = sv_file['epoch'] + 1
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
         else:
             lr_scheduler = MultiStepLR(optimizer, **config['multi_step_lr'])
-        for _ in range(epoch_start - 1):
-            lr_scheduler.step()
+            for _ in range(epoch_start - 1):
+                lr_scheduler.step()
     else:
         model = models.make(config['model']).cuda()
         optimizer = utils.make_optimizer(
@@ -86,9 +145,10 @@ def prepare_training():
     return model, optimizer, epoch_start, lr_scheduler
 
 
+
 def train(train_loader, model, optimizer):
     model.train()
-    loss_fn = nn.L1Loss()
+    loss_fn = nn.L1Loss(reduction='none')
     train_loss = utils.Averager()
 
     data_norm = config['data_norm']
@@ -100,15 +160,25 @@ def train(train_loader, model, optimizer):
     gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
 
     for batch in tqdm(train_loader, leave=False, desc='train'):
+        if batch is None:
+            continue
+
         for k, v in batch.items():
             batch[k] = v.cuda()
 
+        #  추가
         inp = (batch['inp'] - inp_sub) / inp_div
+
         pred = model(inp, batch['level'], batch['coord'], batch['cell'])  # , batch['area']
-        
         gt = (batch['gt'] - gt_sub) / gt_div
+
         loss = loss_fn(pred, gt)
 
+        mask = batch['mask']
+        mask_expanded = mask.unsqueeze(-1)
+        masked_loss = loss * mask_expanded
+
+        loss = masked_loss.sum() / mask_expanded.sum()
         train_loss.add(loss.item())
 
         optimizer.zero_grad()
@@ -191,7 +261,7 @@ def main(config_, save_path):
                 eval_bsize=config.get('eval_bsize'))
 
             log_info.append('val: psnr={:.4f}'.format(val_res))
-            log_info.append('val loss={:.4f}'.format(val_loss))
+            log_info.append('val loss: {:.4f}'.format(val_loss))
             writer.add_scalars('psnr', {'val': val_res}, epoch)
             if val_res > max_val_v:
                 max_val_v = val_res

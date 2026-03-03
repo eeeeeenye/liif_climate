@@ -58,31 +58,68 @@ def make_data_loaders():
     val_loader = make_data_loader(config.get('val_dataset'), tag='val')
     return train_loader, val_loader
 
+def freeze_encoder_(model):
+    for attr in ['encoder', 'backbone', 'edsr', 'body']:
+        m = getattr(model, attr, None)
+        if m is not None:
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+    # 이름 기준으로 한 번 더 안전장치
+    for name, p in model.named_parameters():
+        if name.startswith('encoder') or 'encoder.' in name or 'edsr' in name or name.startswith('body'):
+            p.requires_grad = False
+
+def get_trainable_params(model):
+    return [p for p in model.parameters() if p.requires_grad]
 
 def prepare_training():
     if config.get('resume') is not None:
+        # 1) 모델/옵티마이저 state 로드
         sv_file = torch.load(config['resume'])
         model = models.make(sv_file['model'], load_sd=True).cuda()
-        optimizer = utils.make_optimizer(
-            model.parameters(), sv_file['optimizer'], load_sd=True)
+
+        # 2) 로드 후 encoder 동결 (중요: 로드 다음에!)
+        freeze_encoder_(model)
+
+        # 3) trainable 파라미터만으로 옵티마이저 재구성
+        #    (이전 옵티마이저 state에는 encoder 그룹이 섞여있을 수 있으므로
+        #     안전하게 state는 로드하지 않는 것을 권장)
+        optimizer = utils.make_optimizer(get_trainable_params(model), sv_file['optimizer'], load_sd=False)
+
         epoch_start = sv_file['epoch'] + 1
+
+        # 4) 스케줄러
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
         else:
             lr_scheduler = MultiStepLR(optimizer, **config['multi_step_lr'])
-        for _ in range(epoch_start - 1):
-            lr_scheduler.step()
+            # 재시작 시 에폭만큼 스텝 진행
+            for _ in range(epoch_start - 1):
+                lr_scheduler.step()
+
     else:
+        # 신규 학습
         model = models.make(config['model']).cuda()
-        optimizer = utils.make_optimizer(
-            model.parameters(), config['optimizer'])
+
+        # 모델 생성 직후 encoder 동결
+        freeze_encoder_(model)
+
+        # trainable 파라미터만 optimizer에 전달
+        optimizer = utils.make_optimizer(get_trainable_params(model), config['optimizer'])
         epoch_start = 1
+
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
         else:
             lr_scheduler = MultiStepLR(optimizer, **config['multi_step_lr'])
 
-    log('model: #params={}'.format(utils.compute_num_params(model, text=True)))
+    # 로그: 동결이 실제로 먹었는지 확인
+    n_all = utils.compute_num_params(model)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log(f'model: #params(total)={n_all:,}, #params(trainable)={n_trainable:,}')
+
     return model, optimizer, epoch_start, lr_scheduler
 
 
@@ -104,8 +141,8 @@ def train(train_loader, model, optimizer):
             batch[k] = v.cuda()
 
         inp = (batch['inp'] - inp_sub) / inp_div
-        pred = model(inp, batch['level'], batch['coord'], batch['cell'])  # , batch['area']
-        
+        pred = model(inp, batch['coord'], batch['cell'])
+
         gt = (batch['gt'] - gt_sub) / gt_div
         loss = loss_fn(pred, gt)
 
@@ -185,13 +222,12 @@ def main(config_, save_path):
                 model_ = model.module
             else:
                 model_ = model
-            val_res, val_loss = eval_psnr(val_loader, model_,
+            val_res = eval_psnr(val_loader, model_,
                 data_norm=config['data_norm'],
                 eval_type=config.get('eval_type'),
                 eval_bsize=config.get('eval_bsize'))
 
             log_info.append('val: psnr={:.4f}'.format(val_res))
-            log_info.append('val loss={:.4f}'.format(val_loss))
             writer.add_scalars('psnr', {'val': val_res}, epoch)
             if val_res > max_val_v:
                 max_val_v = val_res

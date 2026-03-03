@@ -7,13 +7,14 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import torch.nn as nn
 
 import datasets
 import models
 import utils
 
 
-def batched_predict(model, inp, coord, cell, bsize):
+def batched_predict(model, inp, level, coord, cell, area, bsize):
     with torch.no_grad():
         model.gen_feat(inp)
         n = coord.shape[1]
@@ -21,7 +22,7 @@ def batched_predict(model, inp, coord, cell, bsize):
         preds = []
         while ql < n:
             qr = min(ql + bsize, n)
-            pred = model.query_rgb(coord[:, ql: qr, :], cell[:, ql: qr, :])
+            pred = model.query_rgb(level, coord[:, ql: qr, :], cell[:, ql: qr, :], area)
             preds.append(pred)
             ql = qr
         pred = torch.cat(preds, dim=1)
@@ -31,6 +32,8 @@ def batched_predict(model, inp, coord, cell, bsize):
 def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
               verbose=False):
     model.eval()
+    loss_fn = nn.L1Loss()
+    eval_loss = utils.Averager()
 
     if data_norm is None:
         data_norm = {
@@ -65,10 +68,16 @@ def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
         inp = (batch['inp'] - inp_sub) / inp_div
         if eval_bsize is None:
             with torch.no_grad():
-                pred = model(inp, batch['coord'], batch['cell'])
+                pred = model(inp,batch['level'], batch['coord'], batch['cell'])   # , batch['area']
         else:
-            pred = batched_predict(model, inp,
-                batch['coord'], batch['cell'], eval_bsize)
+            pred = batched_predict(model, inp, batch['level'],
+                batch['coord'], batch['cell'], eval_bsize)   #, batch['area']
+            
+        gt = (batch['gt'] - gt_sub) / gt_div
+        loss = loss_fn(pred, gt)
+
+        eval_loss.add(loss.item())
+
         pred = pred * gt_div + gt_sub
         pred.clamp_(0, 1)
 
@@ -87,14 +96,14 @@ def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
         if verbose:
             pbar.set_description('val {:.4f}'.format(val_res.item()))
 
-    return val_res.item()
+    return val_res.item(), eval_loss.item()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config')
     parser.add_argument('--model')
-    parser.add_argument('--gpu', default='0')
+    parser.add_argument('--gpu', default='2')
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -111,7 +120,7 @@ if __name__ == '__main__':
     model_spec = torch.load(args.model)['model']
     model = models.make(model_spec, load_sd=True).cuda()
 
-    res = eval_psnr(loader, model,
+    res, eval_loss = eval_psnr(loader, model,
         data_norm=config.get('data_norm'),
         eval_type=config.get('eval_type'),
         eval_bsize=config.get('eval_bsize'),

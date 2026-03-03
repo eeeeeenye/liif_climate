@@ -1,0 +1,74 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/climate/climate_train_korea_imerg50_test
+      root_path_2: ./load/climate/climate_train_korea_imerg100_test
+      obs_path_3: ./data/preprocessed_daily_precip_data_fitOBS.csv
+      meta_path: ./load/climate/meta/train_imerg100_meta_test.json
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      finetune: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/climate/climate_val_korea_imerg50_test
+      root_path_2: ./load/climate/climate_val_korea_imerg100_test
+      obs_path_3: ./data/preproccessed_obs_2010_2019.csv
+      meta_path: ./load/climate/meta/val_imerg100_meta_test.json
+      first_k: 10
+      repeat: 160
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      sample_q: 1024
+      augment: false
+      finetune: true
+  batch_size: 16
+data_norm:
+  inp:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+model:
+  name: liif
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+epoch_max: 1200
+resume: ./save/_climate_edsr_imerg_obs/epoch-last.pth
+multi_step_lr:
+  milestones:
+  - 1000
+  - 1100
+  gamma: 0.5
+epoch_val: 1
+epoch_save: 100

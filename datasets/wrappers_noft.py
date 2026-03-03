@@ -27,7 +27,7 @@ class SRImplicitPaired(Dataset):
 
     def __getitem__(self, idx):
         if self.finetune:
-            img_lr, img_hr, obs_, level = self.dataset[idx]
+            img_lr, img_hr, obs_, level = self.dataset[idx]   #, level
         else:
             img_lr, img_hr, level = self.dataset[idx]
             obs_ = None
@@ -68,11 +68,13 @@ class SRImplicitPaired(Dataset):
 
             crop_lr = augment(crop_lr)
             crop_hr = augment(crop_hr)
+            # crop_obs = augment(crop_obs)
 
         # -----------------------------
         # Pixel samples (좌표/값 펼치기)
         # -----------------------------
         hr_coord, hr_rgb = to_pixel_samples(crop_hr.contiguous())   # (Q,2), (Q,C)
+        obs_coord_len = 0
        
         if self.sample_q is not None:
             n = len(hr_coord)
@@ -88,16 +90,15 @@ class SRImplicitPaired(Dataset):
                 obs_val = obs_val.unsqueeze(-1)
 
             # Nan -> -1 -> mask
-            valid_mask = obs_val.squeeze(-1) != -2.0
-            obs_coord = obs_coord[valid_mask]
-            obs_val = obs_val[valid_mask]
-            obs_val = obs_val.expand(-1, hr_rgb.shape[1])
-        
-            hr_coord = obs_coord
-            hr_rgb = obs_val
+            mask = obs_val.squeeze(-1) != -2.0
+            obs_coord = obs_coord[mask]
+            obs_val = obs_val[mask]
 
-            # obs_area = torch.full_like(hr_rgb, 500)
-            # area_full = obs_area / 25000
+            obs_coord_len, obs_val_len = obs_coord.shape[0], obs_val.shape[0]
+
+            obs_val = obs_val.expand(-1, hr_rgb.shape[1])
+            hr_coord = torch.cat([hr_coord[obs_coord_len:,:], obs_coord], dim=0)
+            hr_rgb = torch.cat([hr_rgb[obs_val_len:,:], obs_val])
         
         # -----------------------------
         # Cell 크기
@@ -106,15 +107,26 @@ class SRImplicitPaired(Dataset):
         cell[:, 0] *= 2 / crop_hr.shape[-2]
         cell[:, 1] *= 2 / crop_hr.shape[-1]
 
+        ##### 추후에는 IMERG 데이터 외 다른 데이터가 들어올 것을 대비해서    #####
+        ##### 그 데이터의 종류에 따라 다른 면적을 줄 수 있도록 코드 수정하기 #####
+        # area = torch.full_like(hr_rgb, 10000)
+
+        # 면적 크기
+        # obs_area = obs_['area']
+        # mask = obs_['mask']
+        # obs_area = obs_area[mask].unsqueeze(1)
+        # area_full = torch.cat([area[obs_coord_len:,:], obs_area], dim = 0)
+
+        # area_norm = area_full/25000
+
         return {
             'inp': crop_lr,
             'coord': hr_coord,
             'cell': cell,
             'gt': hr_rgb,
             'level' : crop_level,
-            # 'area' : area_full
+            # 'area' : area_norm
         }
-
 
 def resize_fn(img, size):
     return transforms.ToTensor()(

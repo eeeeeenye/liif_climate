@@ -5,7 +5,6 @@ from models import register
 
 @register('mlp')
 class MLP(nn.Module):
-
     def __init__(self, in_dim, out_dim, hidden_list):
         super().__init__()
         layers = []

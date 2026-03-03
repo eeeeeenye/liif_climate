@@ -20,7 +20,7 @@ class MeanShift(nn.Conv2d):
         self, rgb_range,
         rgb_mean=(0.4488, 0.4371, 0.4040), rgb_std=(1.0, 1.0, 1.0), sign=-1):
 
-        super(MeanShift, self).__init__(3, 3, kernel_size=1)
+        super(MeanShift, self).__init__(1, 1, kernel_size=1)
         std = torch.Tensor(rgb_std)
         self.weight.data = torch.eye(3).view(3, 3, 1, 1) / std.view(3, 1, 1, 1)
         self.bias.data = sign * rgb_range * torch.Tensor(rgb_mean) / std
@@ -177,7 +177,7 @@ def make_edsr_baseline(n_resblocks=16, n_feats=64, res_scale=1,
     args.no_upsampling = no_upsampling
 
     args.rgb_range = rgb_range
-    args.n_colors = 3
+    args.n_colors = 1
     return EDSR(args)
 
 
@@ -193,5 +193,5 @@ def make_edsr(n_resblocks=32, n_feats=256, res_scale=0.1,
     args.no_upsampling = no_upsampling
 
     args.rgb_range = rgb_range
-    args.n_colors = 3
+    args.n_colors = 1
     return EDSR(args)

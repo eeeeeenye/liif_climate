@@ -15,14 +15,14 @@ class LIIF(nn.Module):
         self.local_ensemble = local_ensemble
         self.feat_unfold = feat_unfold
         self.cell_decode = cell_decode
-        # self.area_decode = area_decode
+
         self.encoder = models.make(encoder_spec)
 
         if imnet_spec is not None:
             imnet_in_dim = self.encoder.out_dim
             if self.feat_unfold:
                 imnet_in_dim *= 9
-            imnet_in_dim += 2
+            imnet_in_dim += 2 # attach coord
             if self.cell_decode:
                 imnet_in_dim += 2
             imnet_in_dim += extra_in_dim
@@ -35,9 +35,10 @@ class LIIF(nn.Module):
         self.feat = self.encoder(inp)
         return self.feat
 
-    def query_rgb(self, coord, cell=None):  # , data_area=None
+    def query_rgb(self, coord, cell=None):
         feat = self.feat        # 16, 256, 100, 100
-        level = self.topo[:, :1, ...]       # 16, 3, 100, 100
+        # level = self.topo[:, :1, ...]       # 16, 3, 100, 100
+        # print(coord.shape)
 
         device = feat.device
 
@@ -67,6 +68,9 @@ class LIIF(nn.Module):
             .permute(2, 0, 1) \
             .unsqueeze(0).expand(feat.shape[0], 2, *feat.shape[-2:])
         
+        
+        # print(feat_coord.shape)
+        # feat_coord shape(feat의 중간좌표): 16, 2, 30, 30
 
         preds = []
         areas = []
@@ -76,7 +80,7 @@ class LIIF(nn.Module):
                 coord_ = coord.clone() # (16 ,1024, 2)
 
                 # hr coord를 feat의 중간 좌표에 맞게 shift -> 중간좌표 조정
-                coord_[:, :, 0] += vx * rx + eps_shift
+                coord_[:, :, 0] += vx * rx + eps_shift      # 질의 좌표의 주변 latent code를 뽑기 위한 코드
                 coord_[:, :, 1] += vy * ry + eps_shift
 
                 # 중간좌표 중 경계값을 벗어난 값을 자동 경계값으로 설정
@@ -99,28 +103,24 @@ class LIIF(nn.Module):
                     mode='nearest', align_corners=False)[:, :, 0, :] \
                     .permute(0, 2, 1)
                 
-                q_level = F.grid_sample(level, coord_.flip(-1).unsqueeze(1),
-                             mode="nearest", align_corners=False)[:, :, 0, :]\
-                            .permute(0,2,1)
+                # q_level = F.grid_sample(level, coord_.flip(-1).unsqueeze(1),
+                #              mode="nearest", align_corners=False)[:, :, 0, :]\
+                #             .permute(0,2,1)
                 
                 rel_coord = coord - q_coord
                 rel_coord[:, :, 0] *= feat.shape[-2]
                 rel_coord[:, :, 1] *= feat.shape[-1]
-                inp = torch.cat([q_feat, rel_coord, q_level], dim=-1)
+                inp = torch.cat([q_feat, rel_coord], dim=-1)
                 # print(q_feat.shape, rel_coord.shape, q_level.shape)     # q_feat : [16, 1024, 2304], [16, 1024,2], [16, 1024, 1]
                 # print(inp.shape)                 # 16, 1024, 2307
 
                 if self.cell_decode:
                     rel_cell = cell.clone()
-                    # print("before :: ",rel_cell[:,:,0])
                     rel_cell[:, :, 0] *= feat.shape[-2]
                     rel_cell[:, :, 1] *= feat.shape[-1]
-                    # print(inp.shape, rel_cell.shape)
                     inp = torch.cat([inp, rel_cell], dim=-1)
                 
-                # if (self.area_decode == True) & (data_area is not None):
-                #     inp = torch.cat([inp, data_area], dim=-1)
-                
+                # 이쪽 부근에 실측자료를 넣으면 될거 같음 실측은 pred를 건너뛰고. 바로 append?
                 bs, q = coord.shape[:2]
                 # print(inp.view(bs * q, -1).shape) # 16384, 2309
                 pred = self.imnet(inp.view(bs * q, -1)).view(bs, q, -1)
@@ -130,14 +130,14 @@ class LIIF(nn.Module):
                 area = torch.abs(rel_coord[:, :, 0] * rel_coord[:, :, 1])
                 areas.append(area + 1e-9)
 
-        """ 상대 좌표는 쿼리 좌표(q)와 기준 좌표(q_coord)의 차이를 통해,
-         복원하려는 위치가 셀 내부에서 어디쯤 있는지를 나타냅니다.
-         이 좌표의 x, y 성분을 곱하면 면적에 해당하는 값이 되어,
-         bilinear weight 계산에 쓰이는 기여도를 표현할 수 있습니다.
-         LIIF 논문에서 말하는 signal이 바로 이 상대 좌표(rel_coord)입니다.
-         즉, 쿼리별 signal을 4개 꼭짓점 feature와 결합하여 후보 예측값을 만들고,
-         쿼리 좌표의 위치에 따라 bilinear weight로 합성하여 최종 HR 값을 예측합니다. """
-
+       # 상대 좌표는 쿼리 좌표(q)와 기준 좌표(q_coord)의 차이를 통해,
+        # 복원하려는 위치가 셀 내부에서 어디쯤 있는지를 나타냅니다.
+        # 이 좌표의 x, y 성분을 곱하면 면적에 해당하는 값이 되어,
+        # bilinear weight 계산에 쓰이는 기여도를 표현할 수 있습니다.
+        # LIIF 논문에서 말하는 signal이 바로 이 상대 좌표(rel_coord)입니다.
+        # 즉, 쿼리별 signal을 4개 꼭짓점 feature와 결합하여 후보 예측값을 만들고,
+        # 쿼리 좌표의 위치에 따라 bilinear weight로 합성하여 최종 HR 값을 예측합니다.
+        # print(preds) 
         tot_area = torch.stack(areas).sum(dim=0)
         if self.local_ensemble:
             t = areas[0]; areas[0] = areas[3]; areas[3] = t
@@ -146,10 +146,10 @@ class LIIF(nn.Module):
 
         for pred, area in zip(preds, areas):
             ret = ret + pred * (area / tot_area).unsqueeze(-1)
+            # print("query_rgb ret shape: ", ret.shape)
         return ret
 
-    def forward(self, inp, topo, coord, cell):  #, area=None
+    def forward(self, inp, coord, cell):
         self.gen_feat(inp)
-        self.topo = topo
-
-        return self.query_rgb(coord, cell)  # , area
+        # self.topo = topo 
+        return self.query_rgb(coord, cell)
