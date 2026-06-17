@@ -1,0 +1,81 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/climate/climate_train_korea_imerg50_test
+      root_path_2: ./load/climate/climate_train_korea_imerg100_test
+      topo_nc_path: ./data/ETOPO1_on_IMERG_Land.nc
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/1998-2009/preprocessed_obs_hourly_to_daily_precip_1998_2009_final.csv
+      meta_path: ./load/climate/meta/climate_train_korea_imerg100.json
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/climate/climate_val_korea_imerg50_2020_2022
+      root_path_2: ./load/climate/climate_val_korea_imerg100_2020_2022
+      topo_nc_path: ./data/ETOPO1_on_IMERG_Land.nc
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/df_2020_2022.csv
+      meta_path: ./load/climate/meta/climate_val_korea_imerg100.json
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+data_norm:
+  inp:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+model:
+  name: liif
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: adapter
+      args:
+        out_dim: 1
+    extra_in_dim: 1
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+epoch_max: 1100
+multi_step_lr:
+  milestones:
+    - 1020
+    - 1040
+    - 1060
+    - 1080
+  gamma: 0.5
+resume: ./save/_climate_edsr_imerg_topo_chmeta_final/epoch-last.pth
+epoch_val: 1
+epoch_save: 1

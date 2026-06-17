@@ -23,6 +23,8 @@
 
 import argparse
 import os
+import random
+import numpy as np
 
 import yaml
 import torch
@@ -121,27 +123,63 @@ def make_data_loaders():
 def prepare_training():
     if config.get('resume') is not None:
         sv_file = torch.load(config['resume'])
-        model = models.make(sv_file['model'], load_sd=True).cuda()
+        pretrained_sd = sv_file['model']['sd']
+
+        model = models.make(config['model']).cuda()
+        missing, unexpected = model.load_state_dict(pretrained_sd, strict=False)
+
+        print("missing keys:", missing)
+        print("unexpected keys:", unexpected)
+        print("has add_layer:", hasattr(model, "add_layer"))
+
+        for p in model.parameters():
+            p.requires_grad = False
+
+        for p in model.add_layer.parameters():
+            p.requires_grad = True
+
         optimizer = utils.make_optimizer(
-            model.parameters(), config['optimizer'])
+            model.add_layer.parameters(),
+            config['optimizer']
+        )
+
+        # 학습시작 전 파라미터 직접 확인
+        print("=" * 50)
+        print("Trainable parameters:")
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                print(f" [TRAIN] {name}")
+            else:
+                print(f" [FROZEN] {name}")
+        print("=" * 50)
+
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen = total - trainable
+
+        print(f"Total params:     {total:,}")
+        print(f"Trainable params: {trainable:,}  ← 이게 add_layer만이어야 함")
+        print(f"Frozen params:    {frozen:,}")
+
         epoch_start = sv_file['epoch'] + 1
+
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
         else:
             lr_scheduler = MultiStepLR(optimizer, **config['multi_step_lr'])
             for _ in range(epoch_start - 1):
                 lr_scheduler.step()
+
     else:
         model = models.make(config['model']).cuda()
-        optimizer = utils.make_optimizer(
-            model.parameters(), config['optimizer'])
+        optimizer = utils.make_optimizer(model.parameters(), config['optimizer'])
         epoch_start = 1
+
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
         else:
             lr_scheduler = MultiStepLR(optimizer, **config['multi_step_lr'])
 
-    log('model: #params={}'.format(utils.compute_num_params(model, text=True)))
     return model, optimizer, epoch_start, lr_scheduler
 
 
@@ -214,6 +252,7 @@ def main(config_, save_path):
     epoch_val = config.get('epoch_val')
     epoch_save = config.get('epoch_save')
     max_val_v = -1e18
+    min_val_loss = 1e18
 
     timer = utils.Timer()
 
@@ -267,6 +306,11 @@ def main(config_, save_path):
                 max_val_v = val_res
                 torch.save(sv_file, os.path.join(save_path, 'epoch-best.pth'))
 
+            if val_loss < min_val_loss:
+                min_val_loss = val_loss
+                torch.save(sv_file, os.path.join(save_path, 'epoch-best-loss.pth'))
+            log_info.append('best val loss={:.4f}'.format(min_val_loss))
+
         t = timer.t()
         prog = (epoch - epoch_start + 1) / (epoch_max - epoch_start + 1)
         t_epoch = utils.time_text(t - t_epoch_start)
@@ -276,8 +320,16 @@ def main(config_, save_path):
         log(', '.join(log_info))
         writer.flush()
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 if __name__ == '__main__':
+    set_seed(42)
     parser = argparse.ArgumentParser()
     parser.add_argument('--config')
     parser.add_argument('--name', default=None)

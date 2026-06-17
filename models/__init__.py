@@ -4,3 +4,4 @@ from . import mlp
 from . import liif
 from . import misc
 from . import liif_finetune
+from . import adapter

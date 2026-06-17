@@ -9,13 +9,12 @@ from utils import make_coord
 
 @register('liif')
 class LIIF(nn.Module):
-    def __init__(self, encoder_spec, imnet_spec=None,
+    def __init__(self, encoder_spec, imnet_spec=None, layer_spec=None,
                  local_ensemble=True, feat_unfold=True, cell_decode=True, extra_in_dim=0):
         super().__init__()
         self.local_ensemble = local_ensemble
         self.feat_unfold = feat_unfold
         self.cell_decode = cell_decode
-        # self.area_decode = area_decode
         self.encoder = models.make(encoder_spec)
 
         if imnet_spec is not None:
@@ -29,15 +28,18 @@ class LIIF(nn.Module):
             self.imnet = models.make(imnet_spec, args={'in_dim': imnet_in_dim})
         else:
             self.imnet = None
+
+        if layer_spec is not None:
+            adapter_in_dim = self.imnet.out_dim
+            self.add_layer = models.make(layer_spec, args={'in_dim': adapter_in_dim})
     
-    # feature map 생성 -> EDSR을 baseline으로 두고 피처맵 추출
     def gen_feat(self, inp):
         self.feat = self.encoder(inp)
         return self.feat
 
-    def query_rgb(self, coord, cell=None):  # , data_area=None
-        feat = self.feat        # 16, 256, 100, 100
-        level = self.topo[:, :1, ...]       # 16, 3, 100, 100
+    def query_rgb(self, coord, cell=None):
+        feat = self.feat                        # 16, 256, 100, 100
+        level = self.topo[:,:1,...]           # 16, 3, 100, 100
 
         device = feat.device
 
@@ -78,8 +80,6 @@ class LIIF(nn.Module):
                 # hr coord를 feat의 중간 좌표에 맞게 shift -> 중간좌표 조정
                 coord_[:, :, 0] += vx * rx + eps_shift
                 coord_[:, :, 1] += vy * ry + eps_shift
-
-                # 중간좌표 중 경계값을 벗어난 값을 자동 경계값으로 설정
                 coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
                 # print(coord_.flip(-1).unsqueeze(1).shape)
 
@@ -103,26 +103,23 @@ class LIIF(nn.Module):
                              mode="nearest", align_corners=False)[:, :, 0, :]\
                             .permute(0,2,1)
                 
+                # print(level.shape)
+                # level = level.permute(0,2,1)
                 rel_coord = coord - q_coord
                 rel_coord[:, :, 0] *= feat.shape[-2]
                 rel_coord[:, :, 1] *= feat.shape[-1]
-                inp = torch.cat([q_feat, rel_coord, q_level], dim=-1)
-                # print(q_feat.shape, rel_coord.shape, q_level.shape)     # q_feat : [16, 1024, 2304], [16, 1024,2], [16, 1024, 1]
+                inp = torch.cat([q_feat, rel_coord, q_level], dim=-1) # q_feat : [16, 1024, 2304], [16, 1024,2], [16, 1024, 1]
                 # print(inp.shape)                 # 16, 1024, 2307
 
                 if self.cell_decode:
                     rel_cell = cell.clone()
-                    # print("before :: ",rel_cell[:,:,0])
                     rel_cell[:, :, 0] *= feat.shape[-2]
                     rel_cell[:, :, 1] *= feat.shape[-1]
-                    # print(inp.shape, rel_cell.shape)
                     inp = torch.cat([inp, rel_cell], dim=-1)
-                
-                # if (self.area_decode == True) & (data_area is not None):
-                #     inp = torch.cat([inp, data_area], dim=-1)
                 
                 bs, q = coord.shape[:2]
                 # print(inp.view(bs * q, -1).shape) # 16384, 2309
+
                 pred = self.imnet(inp.view(bs * q, -1)).view(bs, q, -1)
                 preds.append(pred)
                 # print("pred shape : ",pred.shape)                 # 16, 1024, 2
@@ -146,10 +143,20 @@ class LIIF(nn.Module):
 
         for pred, area in zip(preds, areas):
             ret = ret + pred * (area / tot_area).unsqueeze(-1)
+
         return ret
+    
+    # adapter layer 추가
+    def correction_layer(self, preds):
+        if hasattr(self, 'add_layer'):
+            # print(preds.shape)
+            return self.add_layer(preds)
+        return preds
 
     def forward(self, inp, topo, coord, cell):  #, area=None
         self.gen_feat(inp)
         self.topo = topo
+        preds = self.query_rgb(coord, cell)
+        # print(preds.shape)
 
-        return self.query_rgb(coord, cell)  # , area
+        return self.correction_layer(preds)

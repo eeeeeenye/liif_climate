@@ -1,7 +1,5 @@
 import torch.nn as nn
-
 from models import register
-
 
 @register('mlp')
 class MLP(nn.Module):
@@ -9,6 +7,7 @@ class MLP(nn.Module):
         super().__init__()
         layers = []
         lastv = in_dim
+        self.out_dim = out_dim
         for hidden in hidden_list:
             layers.append(nn.Linear(lastv, hidden))
             layers.append(nn.ReLU())
