@@ -3,3 +3,4 @@ folders
 load
 data
 save
+tmux-*.log
