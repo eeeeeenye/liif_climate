@@ -34,7 +34,7 @@ class LIIF(nn.Module):
                 imnet_in_dim *= 9
 
             # 상대좌표 rel_coord(x, y) 추가
-            # q_coord: [16, 59, 2]
+            # q_coord: [16, 59, 2]      -----> 첫번째 배치는 max_len(가장 많은 stations)이 59입니다!
             # rel_coord: [16, 59, 2]
             imnet_in_dim += 2
 

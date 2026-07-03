@@ -46,6 +46,7 @@ ASOS 자료는 날짜마다 관측 스테이션의 개수가 달라 각 샘플�
 coord, gt, cell을 padding(일정한 길이로 만들고 부족한 부분을 0으로 채우기)하고,
 실제 데이터 위치를 구분하기 위한 mask(padding한 부분을 알려주는 mask 배열)를 생성한다.
 """
+
 def pad_collate(batch):
     lengths = [b['coord'].shape[0] for b in batch]          # 각 샘플의 coord 개수, 즉 해당 샘플이 가진 station/query point 개수를 리스트로 저장
     max_len = max(lengths)                                  # 배치 안에서 가장 긴 station/query point 개수를 구해 padding 기준 길이로 사용
@@ -79,11 +80,11 @@ def pad_collate(batch):
         pad_len = max_len-q                                 # 현재 샘플 길이 q를 배치 최대 길이 max_len에 맞추기 위해 추가해야 하는 길이
 
         # coord, gt, cell 패딩 채우기
-        # coord의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [68(최대 스테이션 개수),2]
+        # coord의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [max_len,2]
         coord_padded = F.pad(coord, (0,0,0,pad_len))
-        # gt의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [68(최대 스테이션 개수),1]     
+        # gt의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [max_len,1]     
         gt_padded = F.pad(gt, (0, 0, 0, pad_len))
-        # cell의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [68(최대 스테이션 개수),2]              
+        # cell의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [max_len,2]              
         cell_padded = F.pad(cell, (0, 0, 0, pad_len))        
 
         # 배열 길이만큼의 mask 배열 생성
@@ -91,7 +92,7 @@ def pad_collate(batch):
         print('mask shape : ', mask.shape)
         # 실제 데이터가 있는 위치를 1.0으로 할당
         # 1: 실제 스테이션 데이터, 0: 패딩으로 추가한 가짜 데이터
-        mask[:q] = 1.0                                      # dim : [68]
+        mask[:q] = 1.0                                      # dim : [max_len]  
 
         # 이 코드에서 append는 샘플 하나를 리스트에 추가하는 것!
         # 예시 입니다! [inp1(shape: 1,50,50), inp2(shape:1, 50,50), ...] -> 그냥 리스트이므로 axis가 없습니다!
