@@ -4,7 +4,7 @@ train_dataset:
     args:
       root_path_1: ./load/climate/climate_train_korea_imerg50_test
       root_path_2: ./load/climate/climate_train_korea_imerg100_test
-      topo_nc_path: ./data/ETOPO1_on_IMERG_Land.nc
+      topo_nc_path: /home/inhye_yoo/deeplearning/inr/liif/asos_data/ETOPO1_on_IMERG_Land.nc
       obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/1998-2009/preprocessed_obs_hourly_to_daily_precip_1998_2009_final.csv
       meta_path: ./load/climate/meta/climate_train_korea_imerg100.json
       cache: in_memory
@@ -21,7 +21,7 @@ val_dataset:
     args:
       root_path_1: ./load/climate/climate_val_korea_imerg50_2020_2022
       root_path_2: ./load/climate/climate_val_korea_imerg100_2020_2022
-      topo_nc_path: ./data/ETOPO1_on_IMERG_Land.nc
+      topo_nc_path: /home/inhye_yoo/deeplearning/inr/liif/asos_data/ETOPO1_on_IMERG_Land.nc
       obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/df_2020_2022.csv
       meta_path: ./load/climate/meta/climate_val_korea_imerg100.json
       cache: in_memory
@@ -68,14 +68,7 @@ optimizer:
   name: adam
   args:
     lr: 0.0001
-epoch_max: 1100
-multi_step_lr:
-  milestones:
-    - 1020
-    - 1040
-    - 1060
-    - 1080
-  gamma: 0.5
+epoch_max: 1200
 resume: ./save/_climate_edsr_imerg_topo_chmeta_final/epoch-last.pth
 epoch_val: 1
 epoch_save: 1

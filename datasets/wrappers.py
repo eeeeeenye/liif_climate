@@ -12,262 +12,273 @@ from datasets import register
 from utils import to_pixel_samples
 
 
-from datasets import register
-from utils import to_pixel_samples
+# level + observation
+# 이 wrapper는 이미 LR/HR pair가 존재하는 dataset을 받아서
+# LIIF 학습에 필요한 inp, coord, cell, gt 형태로 바꿔주는 클래스
+# 제 모델에서는 SRImplicitPaired를 사용하였습니다!
+@register('sr-implicit-paired')  # 이 클래스를 datasets registry에 'sr-implicit-paired' 이름으로 등록
+class SRImplicitPaired(Dataset):  # PyTorch Dataset을 상속받는 LIIF용 wrapper 클래스
 
-
-# level + observation 
-@register('sr-implicit-paired')
-class SRImplicitPaired(Dataset):
-    # LR-HR paired dataset을 LIIF 학습용 형태로 감싸는 wrapper
-    def __init__(self, dataset, inp_size=None, augment=False, sample_q=None, obs_state=False):
-        self.dataset = dataset        # 원본 dataset
-        self.inp_size = inp_size      # LR crop 크기. None이면 전체 사용
-        self.augment = augment        # flip augmentation 여부
-        self.sample_q = sample_q      # HR pixel 중 몇 개 query point만 뽑을지
-        self.obs_state = obs_state    # 관측값 obs를 같이 쓸지 여부
+    def __init__(self, dataset, inp_size=None, augment=False,
+                 sample_q=None, obs_state=False):
+        self.dataset = dataset        # 원본 dataset 저장
+        self.inp_size = inp_size      # LR patch 크기, None이면 전체 이미지 사용
+        self.augment = augment        # data augmentation 사용 여부
+        self.sample_q = sample_q      # HR query point 중 sampling할 개수
+        self.obs_state = obs_state    # 관측소 supervision 사용 여부
 
     def __len__(self):
-        # dataset 전체 길이 반환
-        return len(self.dataset)
+        return len(self.dataset)      # 원본 dataset 길이를 그대로 반환
 
     def __getitem__(self, idx):
-        # idx번째 샘플을 가져옴
-        if self.obs_state:
-            # observation을 쓰는 경우
+        if self.obs_state:            # 관측소 자료를 사용하는 경우
             img_lr, img_hr, obs_, level = self.dataset[idx]
-        else:
-            # observation을 안 쓰는 경우
+            # img_lr : (1, 50, 50)      # LR 입력 이미지
+            # img_hr : (1, 100, 100)    # HR 정답 이미지
+            # obs_   : 관측소 dict      # {'coord', 'gt'} 포함
+            # level  : (1, 100, 100)    # topo / level 정보
+
+        else:                         # 관측소 자료를 사용하지 않는 경우
             img_lr, img_hr, level = self.dataset[idx]
-            obs_ = None
+            obs_ = None               # observation 없음
 
-        # HR/LR scale factor 계산
-        # 예: HR height 128, LR height 32이면 s=4
         s = img_hr.shape[-2] // img_lr.shape[-2]
+        # scale factor 계산
+        # 100 // 50 = 2
 
-        if self.inp_size is None:
-            # crop 없이 전체 LR/HR 사용
+        if self.inp_size is None:     # patch crop 없이 전체 이미지 사용
             h_lr, w_lr = img_lr.shape[-2:]
+            # h_lr = 50, w_lr = 50
 
-            # HR 크기를 LR 크기 * scale에 맞춰 자름
             img_hr = img_hr[:, :h_lr * s, :w_lr * s]
+            # img_hr를 LR 크기 * scale에 맞게 자름
+            # img_hr : (1, 100, 100)
 
-            # crop 결과는 전체 이미지
             crop_lr, crop_hr = img_lr, img_hr
+            # crop_lr : (1, 50, 50)
+            # crop_hr : (1, 100, 100)
 
-            # level도 그대로 사용
             crop_level = level
-        else:
-            # LR에서 inp_size 크기만큼 random crop
-            w_lr = self.inp_size
+            # crop_level : (1, 100, 100)
 
-            # LR crop 시작 위치 랜덤 선택
+        else:                         # inp_size가 있으면 random crop 사용
+            w_lr = self.inp_size      # LR patch 크기
+
             x0 = random.randint(0, img_lr.shape[-2] - w_lr)
+            # LR 이미지에서 crop 시작 height index 선택
+
             y0 = random.randint(0, img_lr.shape[-1] - w_lr)
+            # LR 이미지에서 crop 시작 width index 선택
 
-            # LR crop 추출
-            crop_lr = img_lr[:, x0: x0 + w_lr, y0: y0 + w_lr]
+            crop_lr = img_lr[:, x0:x0+w_lr, y0:y0+w_lr]
+            # LR patch crop
+            # crop_lr : (1, w_lr, w_lr)
 
-            # HR crop 크기 = LR crop 크기 * scale
             w_hr = w_lr * s
+            # HR patch 크기 = LR patch 크기 * scale
 
-            # LR crop 시작점을 HR 좌표로 변환
             x1, y1 = x0 * s, y0 * s
+            # LR crop 위치를 HR 좌표계로 변환
 
-            # 대응되는 HR crop 추출
-            crop_hr = img_hr[:, x1: x1 + w_hr, y1: y1 + w_hr]
+            crop_hr = img_hr[:, x1:x1+w_hr, y1:y1+w_hr]
+            # HR patch crop
+            # crop_hr : (1, w_hr, w_hr)
 
-            # 주의: 원 코드에서는 crop_level이 여기서 정의되지 않음
-            # return에서 crop_level을 사용하므로 inp_size가 None이 아니면 에러 가능
-            # 필요하면 crop_level = level 또는 level도 crop해야 함
+            crop_level = level[:, x1:x1+w_hr, y1:y1+w_hr]
+            # level도 HR과 같은 위치로 crop
+            # crop_level : (1, w_hr, w_hr)
 
-        if self.augment:
-            # augmentation 여부를 랜덤으로 결정
-            hflip = random.random() < 0.5
-            vflip = random.random() < 0.5
-            dflip = random.random() < 0.5
+        if self.augment:              # augmentation을 사용하는 경우
+            hflip = random.random() < 0.5  # 50% 확률로 height 방향 flip
+            vflip = random.random() < 0.5  # 50% 확률로 width 방향 flip
+            dflip = random.random() < 0.5  # 50% 확률로 H/W transpose
 
-            def augment(x):
-                # x가 None이면 그대로 반환
+            def augment(x):           # crop_lr, crop_hr에 같은 변환 적용
                 if x is None:
-                    return None
+                    return None       # None이면 그대로 반환
 
-                # -2축 flip: 보통 H 방향
                 if hflip:
-                    x = x.flip(-2)
+                    x = x.flip(-2)    # height 방향 flip
 
-                # -1축 flip: 보통 W 방향
                 if vflip:
-                    x = x.flip(-1)
+                    x = x.flip(-1)    # width 방향 flip
 
-                # H/W transpose
                 if dflip:
-                    x = x.transpose(-2, -1)
+                    x = x.transpose(-2, -1)  # height와 width 축 교환
 
-                return x
+                return x              # augmentation된 tensor 반환
 
-            # LR과 HR에 같은 augmentation 적용
             crop_lr = augment(crop_lr)
+            # crop_lr shape 유지: (1, 50, 50)
+
             crop_hr = augment(crop_hr)
+            # crop_hr shape 유지: (1, 100, 100)
 
-        # HR 이미지를 좌표와 값으로 펼침
-        # crop_hr: (C,H,W)
-        # hr_coord: (H*W,2)
-        # hr_rgb: (H*W,C)
         hr_coord, hr_rgb = to_pixel_samples(crop_hr.contiguous())
+        # HR 이미지를 LIIF query 형태로 변환
+        # crop_hr  : (1, 100, 100)
+        # hr_coord : (10000, 2)
+        # hr_rgb   : (10000, 1)
 
-        # observation 개수 초기값
-        obs_coord_len = 0
-       
-        if self.sample_q is not None:
-            # 전체 HR pixel 수
-            n = len(hr_coord)
+        if self.sample_q is not None:  # query point를 일부만 sampling하는 경우
+            n = len(hr_coord)          # 전체 HR pixel 개수, 여기서는 10000
 
-            # sample_q가 전체 개수보다 크면 전체 개수까지만 사용
-            q = min(self.sample_q, n)
+            q = min(self.sample_q, n)  # sample_q가 n보다 크면 n개만 사용
 
-            # q개 좌표를 중복 없이 랜덤 선택
             sample_idx = np.random.choice(n, q, replace=False)
+            # 중복 없이 q개 index 선택
 
-            # 좌표와 gt를 같은 인덱스로 샘플링
             hr_coord = hr_coord[sample_idx]
+            # 선택된 좌표만 사용
+            # hr_coord : (sample_q, 2)
+
             hr_rgb = hr_rgb[sample_idx]
+            # 선택된 좌표의 HR 값만 사용
+            # hr_rgb : (sample_q, 1)
 
-        if obs_ is not None:
-            # observation 좌표와 값 가져오기
+        if obs_ is not None:           # 관측소 supervision을 사용하는 경우
             obs_coord = obs_['coord']
-            obs_val = obs_['gt']
+            # 관측소 좌표
+            # obs_coord : (stations, 2)
 
-            # obs_val이 (N,)이면 (N,1)로 변경
+            obs_val = obs_['gt']
+            # 관측소 관측값
+            # obs_val : (stations,) 또는 (stations, 1)
+
             if obs_val.ndim == 1:
                 obs_val = obs_val.unsqueeze(-1)
+                # channel 차원 추가
+                # obs_val : (stations, 1)
 
-            # -2.0을 결측값으로 보고 제거
-            mask = obs_val.squeeze(-1) != -2.0
-            obs_coord = obs_coord[mask]
-            obs_val = obs_val[mask]
+            valid_mask = obs_val.squeeze(-1) != -2.0
+            # 결측값 -2.0이 아닌 관측소만 True
 
-            # 유효 observation 개수
-            obs_coord_len, obs_val_len = obs_coord.shape[0], obs_val.shape[0]
+            obs_coord = obs_coord[valid_mask]
+            # 유효한 관측소 좌표만 남김
+            # obs_coord : (valid_stations, 2)
 
-            # observation 값의 channel 수를 hr_rgb channel 수와 맞춤
+            obs_val = obs_val[valid_mask]
+            # 유효한 관측값만 남김
+            # obs_val : (valid_stations, 1)
+
             obs_val = obs_val.expand(-1, hr_rgb.shape[1])
+            # gt channel 수를 hr_rgb channel 수와 맞춤
+            # 현재 channel=1이므로 shape 유지
+            # obs_val : (valid_stations, 1)
 
-            # 기존 HR 샘플 일부를 빼고 observation 좌표를 뒤에 붙임
-            hr_coord = torch.cat([hr_coord[obs_coord_len:,:], obs_coord], dim=0)
+            hr_coord = obs_coord
+            # 기존 HR pixel 좌표를 관측소 좌표로 교체
+            # hr_coord : (valid_stations, 2)
 
-            # 값도 동일하게 observation 값을 뒤에 붙임
-            hr_rgb = torch.cat([hr_rgb[obs_val_len:,:], obs_val])
+            hr_rgb = obs_val
+            # 기존 HR pixel gt를 관측소 관측값으로 교체
+            # hr_rgb : (valid_stations, 1)
 
-            # observation 여부를 표시하는 mask
-            # 0: 일반 HR pixel
-            # 1: observation point
-            is_obs = torch.cat([
-                torch.zeros(hr_coord.shape[0] - obs_coord_len, 1),
-                torch.ones(obs_coord_len, 1)
-            ], dim=0)
-        
-        # 각 query point의 cell 크기 생성
         cell = torch.ones_like(hr_coord)
+        # coord와 같은 shape로 cell 생성
+        # obs 사용 X : (sample_q, 2) 또는 (10000, 2)
+        # obs 사용 O : (valid_stations, 2)
 
-        # LIIF 좌표계가 [-1,1]이므로 전체 길이 2
-        # height 방향 cell 크기 = 2 / H
         cell[:, 0] *= 2 / crop_hr.shape[-2]
+        # y 방향 cell 크기 설정
+        # crop_hr height = 100이면 2 / 100 = 0.02
 
-        # width 방향 cell 크기 = 2 / W
         cell[:, 1] *= 2 / crop_hr.shape[-1]
+        # x 방향 cell 크기 설정
+        # crop_hr width = 100이면 2 / 100 = 0.02
 
-        # LIIF 모델 학습에 필요한 dictionary 반환
         return {
-            'inp': crop_lr,        # LR 입력
-            'coord': hr_coord,     # query 좌표
-            'cell': cell,          # query cell 크기
-            'gt': hr_rgb,          # 정답 HR 값
-            'level' : crop_level,  # 추가 조건 정보
-            # 'is_obs' : is_obs
-            # 'area' : area_norm
+            'inp': crop_lr,        # LR input, shape: (1, 50, 50)
+            'coord': hr_coord,     # query 좌표, obs 사용 시: (valid_stations, 2)
+            'cell': cell,          # query cell 크기, obs 사용 시: (valid_stations, 2)
+            'gt': hr_rgb,          # 정답값, obs 사용 시: (valid_stations, 1)
+            'level': crop_level,   # topo/level input, shape: (1, 100, 100)
         }
 
-
 def resize_fn(img, size):
-    # tensor image를 PIL로 바꾸고 bicubic resize 후 다시 tensor로 변환
+    # Tensor image를 PIL image로 변환
+    # BICUBIC resize 수행
+    # 다시 Tensor로 변환
     return transforms.ToTensor()(
         transforms.Resize(size, Image.BICUBIC)(
-            transforms.ToPILImage()(img)))
+            transforms.ToPILImage()(img)
+        )
+    )
 
 
+# HR 이미지만 있는 dataset에서
+# bicubic downsampling으로 LR을 만든 뒤 LIIF 학습 형태로 바꾸는 wrapper
 @register('sr-implicit-downsampled')
 class SRImplicitDownsampled(Dataset):
-    # HR 이미지에서 LR 이미지를 downsample해서 만드는 wrapper
 
     def __init__(self, dataset, inp_size=None, scale_min=1, scale_max=None,
                  augment=False, sample_q=None):
-        self.dataset = dataset      # 원본 dataset
-        self.inp_size = inp_size    # LR crop 크기
-        self.scale_min = scale_min  # 최소 scale factor
+        # 원본 dataset
+        self.dataset = dataset
 
-        # scale_max가 없으면 scale_min과 같게 설정
+        # LR patch 크기
+        self.inp_size = inp_size
+
+        # 최소 scale
+        self.scale_min = scale_min
+
+        # 최대 scale이 없으면 고정 scale로 사용
         if scale_max is None:
             scale_max = scale_min
 
-        self.scale_max = scale_max  # 최대 scale factor
-        self.augment = augment      # augmentation 여부
-        self.sample_q = sample_q    # query sample 개수
+        self.scale_max = scale_max
+
+        # augmentation 여부
+        self.augment = augment
+
+        # query sampling 개수
+        self.sample_q = sample_q
 
     def __len__(self):
-        # dataset 길이 반환
+        # 원본 dataset 길이
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        # 원본 dataset에서 이미지와 topo 가져오기
-        img, topo = self.dataset[idx]
+        # 원본 HR image 하나를 가져옴
+        img = self.dataset[idx]
 
-        # scale factor를 scale_min~scale_max 사이에서 랜덤 선택
+        # scale_min~scale_max 사이에서 랜덤 배율 선택
         s = random.uniform(self.scale_min, self.scale_max)
 
+        # inp_size가 없으면 전체 이미지를 사용
         if self.inp_size is None:
-            # 전체 이미지를 사용할 경우 LR 크기 계산
+            # scale s에 맞는 LR 크기 계산
             h_lr = math.floor(img.shape[-2] / s + 1e-9)
             w_lr = math.floor(img.shape[-1] / s + 1e-9)
 
-            # LR 크기에 대응되는 HR 크기 계산
-            h_hr = round(h_lr * s)
-            w_hr = round(w_lr * s)
+            # HR 크기를 LR*s에 맞도록 자름
+            img = img[:, :round(h_lr * s), :round(w_lr * s)]
 
-            # HR 이미지와 topo를 대응 크기로 자름
-            img = img[:, :h_hr, :w_hr]
-            topo = topo[:, :h_hr, :w_hr]
-
-            # HR 이미지를 bicubic downsample해서 LR 생성
+            # HR을 bicubic downsample해서 LR 생성
             img_down = resize_fn(img, (h_lr, w_lr))
 
-            # crop 결과 저장
-            crop_lr = img_down
-            crop_hr = img
-            crop_topo = topo
+            crop_lr, crop_hr = img_down, img
 
+        # inp_size가 있으면 HR에서 patch를 뽑고 downsample해서 LR 생성
         else:
-            # LR crop 크기
+            # LR patch 크기
             w_lr = self.inp_size
 
-            # HR crop 크기 = LR crop 크기 * scale
+            # scale을 고려한 HR patch 크기
             w_hr = round(w_lr * s)
 
-            # HR 이미지에서 crop 시작 위치 랜덤 선택
+            # HR patch 시작 위치 랜덤 선택
             x0 = random.randint(0, img.shape[-2] - w_hr)
             y0 = random.randint(0, img.shape[-1] - w_hr)
 
-            # HR crop 추출
-            crop_hr = img[:, x0:x0 + w_hr, y0:y0 + w_hr]
+            # HR patch crop
+            crop_hr = img[:, x0: x0 + w_hr, y0: y0 + w_hr]
 
-            # topo도 같은 위치에서 crop
-            crop_topo = topo[:, x0:x0 + w_hr, y0:y0 + w_hr]
-
-            # HR crop을 LR 크기로 downsample
+            # HR patch를 LR 크기로 bicubic downsample
             crop_lr = resize_fn(crop_hr, w_lr)
 
+        # data augmentation
         if self.augment:
-            # augmentation 여부 랜덤 결정
             hflip = random.random() < 0.5
             vflip = random.random() < 0.5
             dflip = random.random() < 0.5
@@ -287,122 +298,119 @@ class SRImplicitDownsampled(Dataset):
 
                 return x
 
-            # LR, HR, topo 모두 같은 augmentation 적용
+            # LR/HR에 같은 augmentation 적용
             crop_lr = augment(crop_lr)
             crop_hr = augment(crop_hr)
-            crop_topo = augment(crop_topo)
 
-        # HR crop을 query coordinate와 gt value로 펼침
+        # HR patch를 좌표와 값으로 펼침
         hr_coord, hr_rgb = to_pixel_samples(crop_hr.contiguous())
 
-        # topo도 같은 pixel 순서로 펼침
-        # 좌표는 이미 있으므로 버림
-        _, hr_topo = to_pixel_samples(crop_topo.contiguous())
-
+        # 일부 query만 sampling
         if self.sample_q is not None:
-            # query point 일부만 랜덤 선택
             sample_lst = np.random.choice(
-                len(hr_coord), self.sample_q, replace=False
+                len(hr_coord),
+                self.sample_q,
+                replace=False
             )
 
-            # coord, gt, topo를 같은 인덱스로 샘플링
             hr_coord = hr_coord[sample_lst]
             hr_rgb = hr_rgb[sample_lst]
-            hr_topo = hr_topo[sample_lst]
 
-        # cell size 생성
+        # LIIF cell 크기 생성
         cell = torch.ones_like(hr_coord)
 
-        # [-1,1] 좌표계에서 height 방향 cell 크기
         cell[:, 0] *= 2 / crop_hr.shape[-2]
-
-        # [-1,1] 좌표계에서 width 방향 cell 크기
         cell[:, 1] *= 2 / crop_hr.shape[-1]
 
-        # LIIF 학습용 dictionary 반환
         return {
-            'inp': crop_lr,      # downsampled LR 입력
-            'coord': hr_coord,   # HR query 좌표
-            'cell': cell,        # cell 크기
-            'gt': hr_rgb,        # HR 정답값
-            'level': hr_topo     # topo를 추가 조건으로 사용
+            'inp': crop_lr,      # bicubic으로 만든 LR input
+            'coord': hr_coord,   # HR query 좌표 
+            'cell': cell,        # query cell 크기
+            'gt': hr_rgb         # HR 정답값
         }
 
 
+# 다양한 HR size를 사용하기 위한 wrapper
 @register('sr-implicit-uniform-varied')
 class SRImplicitUniformVaried(Dataset):
-    # HR 크기를 sample index에 따라 다양하게 바꾸는 wrapper
 
     def __init__(self, dataset, size_min, size_max=None,
                  augment=False, gt_resize=None, sample_q=None):
-        self.dataset = dataset      # 원본 dataset
-        self.size_min = size_min    # 최소 HR size
+        # 원본 dataset
+        self.dataset = dataset
 
-        # size_max가 없으면 size_min과 같게 설정
+        # 최소 HR 크기
+        self.size_min = size_min
+
+        # 최대 HR 크기
+        # 없으면 size_min으로 고정
         if size_max is None:
             size_max = size_min
 
-        self.size_max = size_max    # 최대 HR size
-        self.augment = augment      # augmentation 여부
-        self.gt_resize = gt_resize  # GT resize 크기
-        self.sample_q = sample_q    # query sample 개수
+        self.size_max = size_max
+
+        # augmentation 여부
+        self.augment = augment
+
+        # GT를 최종적으로 특정 크기로 resize할지
+        self.gt_resize = gt_resize
+
+        # query sampling 개수
+        self.sample_q = sample_q
 
     def __len__(self):
-        # dataset 길이 반환
+        # 원본 dataset 길이
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        # 디버깅용 출력으로 보임
-        # 주의: self.dataset[idx]가 tuple이면 .shape가 없어서 에러 가능
-        print(self.dataset[idx].shape[1:])
-
-        # LR, HR 이미지 가져오기
         img_lr, img_hr = self.dataset[idx]
 
-        # idx를 0~1 사이 비율로 변환
+        # dataset index에 따라 0~1 사이 값 생성
         p = idx / (len(self.dataset) - 1)
 
-        # idx에 따라 HR 크기를 size_min~size_max 사이에서 선형적으로 결정
-        w_hr = round(self.size_min + (self.size_max - self.size_min) * p)
+        # index가 커질수록 HR 크기를 size_min에서 size_max까지 증가시킴
+        w_hr = round(
+            self.size_min +
+            (self.size_max - self.size_min) * p
+        )
 
-        # HR 이미지를 w_hr 크기로 resize
+        # HR을 해당 크기로 resize
         img_hr = resize_fn(img_hr, w_hr)
 
+        # augmentation
         if self.augment:
             # 50% 확률로 W 방향 flip
             if random.random() < 0.5:
                 img_lr = img_lr.flip(-1)
                 img_hr = img_hr.flip(-1)
 
+        # gt_resize가 있으면 HR을 다시 지정 크기로 resize
         if self.gt_resize is not None:
-            # gt_resize가 지정되면 HR을 다시 해당 크기로 resize
             img_hr = resize_fn(img_hr, self.gt_resize)
 
-        # HR 이미지를 query coordinate와 gt value로 펼침
+        # HR을 좌표와 값으로 펼침
         hr_coord, hr_rgb = to_pixel_samples(img_hr)
 
+        # 일부 query만 sampling
         if self.sample_q is not None:
-            # query point 일부만 랜덤 선택
             sample_lst = np.random.choice(
-                len(hr_coord), self.sample_q, replace=False)
+                len(hr_coord),
+                self.sample_q,
+                replace=False
+            )
 
-            # coord와 gt를 같은 인덱스로 샘플링
             hr_coord = hr_coord[sample_lst]
             hr_rgb = hr_rgb[sample_lst]
 
-        # cell size 생성
+        # LIIF cell 크기 생성
         cell = torch.ones_like(hr_coord)
 
-        # [-1,1] 좌표계에서 height 방향 cell 크기
         cell[:, 0] *= 2 / img_hr.shape[-2]
-
-        # [-1,1] 좌표계에서 width 방향 cell 크기
         cell[:, 1] *= 2 / img_hr.shape[-1]
 
-        # LIIF 학습용 dictionary 반환
         return {
-            'inp': img_lr,       # LR 입력
-            'coord': hr_coord,   # query 좌표
-            'cell': cell,        # cell 크기
-            'gt': hr_rgb         # 정답 HR 값
+            'inp': img_lr,      # LR input
+            'coord': hr_coord,  # HR query 좌표
+            'cell': cell,       # query cell 크기
+            'gt': hr_rgb        # HR 정답값
         }
