@@ -143,7 +143,7 @@ class SRImplicitPaired(Dataset):  # PyTorch Dataset을 상속받는 LIIF용 wrap
 
             obs_val = obs_['gt']
             # 관측소 관측값
-            # obs_val : (stations,) 또는 (stations, 1)
+            # obs_val : (stations,)
 
             if obs_val.ndim == 1:
                 obs_val = obs_val.unsqueeze(-1)
