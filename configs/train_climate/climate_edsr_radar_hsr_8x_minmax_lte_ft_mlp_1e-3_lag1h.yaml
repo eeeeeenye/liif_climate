@@ -1,0 +1,93 @@
+# =====================================================================
+# climate_edsr_radar_hsr_8x_minmax_liif_ft_mlp_1e-3_lag1h.yaml 의 LTE 판.
+# model = _climate_edsr_radar_hsr_8x_minmax_lte (LIIF 아님) finetune: ASOS 시간별 관측으로
+# MLP correction layer(adapter, [32,16,32] 1개)만 학습.  encoder/imnet 은 물론
+# LTE 고유 모듈(coef/freq/phase, 진폭·주파수·위상)도 전부 freeze (train_liif_finetune.py 의
+# prepare_training() 이 model.coef/freq/phase 를 hasattr 로 감지해 자동 freeze -> add_layer 만 학습).
+#   - 데이터/전처리는 8x LIIF ft 설정과 완전히 동일(같은 obs csv/meta, 같은 LR/HR nc) -> 모델 종류만 다름.
+#   실행:
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_liif_finetune.py \
+#       --config configs/train_climate/climate_edsr_radar_hsr_8x_minmax_lte_ft_mlp_1e-3_lag1h.yaml \
+#       --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_norm_8x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48   # 8x LIIF ft 와 동일 이유(관측소 anchor crop, 스텝당 관측소 수 확보는 batch_size 로)
+  batch_size: 64
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_norm_8x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 32
+
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+# 8x LTE 사전학습 체크포인트 (저장된 epoch = 500, _climate_edsr_radar_hsr_4x_minmax_lte 에서 이어받아 학습됨)
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_8x_minmax_lte/epoch-last.pth
+
+# ---- 모델 (참고용; 실제 encoder/imnet/coef/freq/phase 구조·가중치는 resume 체크포인트에서 로드) -----
+model:
+  name: lte
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: adapter
+      args:
+        out_dim: 1
+        hidden_dims:
+        - 32
+        - 16
+        - 32
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.001   # 8x/2x LIIF adapter finetune 에서 안정적이었던 lr 재사용
+
+# resume 체크포인트 epoch=500 -> epoch_start=501. epoch_max 는 반드시 500 보다 커야 함.
+epoch_max: 800   # 실질 300 epoch (501~800), 8x LIIF ft 와 동일 관례
+epoch_val: 1
+epoch_save: 1

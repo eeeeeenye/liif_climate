@@ -1,0 +1,107 @@
+# =====================================================================
+# [2026-10-05] HSR 8x lte/liif ft mlp 1e-3 lag1h wmae 128/64/128 설정(어댑터 128/64/128, lr 1e-3, wmae, resume 방식)을 그대로 두고
+#   데이터/체크포인트만 IMERG 0.2->0.1deg topo LTE (_climate_edsr_topo_80x100_topo_minmax_lte) 로 교체한 ASOS 일강수 finetune.
+#   - encoder/imnet 은 freeze, adapter(layer_spec)만 학습 (resume 체크포인트에는 adapter 가 없으므로 새로 초기화됨)
+#   - GT: ASOS 일강수 관측소 (obs_state: true), 손실 wmae (w_min/max 는 HSR 값 1/30 그대로; 단위는 일강수 mm/day 로 바뀜에 유의)
+#   실행:
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_liif_finetune_vzero_wmae.py \
+#       --config configs/train_climate/climate_edsr_topo_80x100_topo_minmax_lte_ft_mlp_1e-3_wmae_128_64_128.yaml \
+#       --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_1998_2009_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_1998_2009_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_1998_2009_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true      # ASOS 관측소 값이 GT. 날짜마다 지점 수가 달라 pad_collate 로 padding+mask.
+      sample_q: 1024        # obs_state=true 면 그리드 샘플이 관측소로 대체되어 사실상 미사용
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_2020_2022_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_2020_2022_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_2020_2022_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+
+# pred/gt([0,1]) <-> mm/day 변환. eval_psnr(PSNR) 계산에 사용.
+# meta 의 min_val/max_val 과 동일 => obs GT 도 이 값으로 denorm 가능.
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 506.01995849609375
+
+# 이어서 학습할 사전학습 체크포인트
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_topo_80x100_topo_minmax_lte/epoch-last.pth
+
+# ---- 모델 (참고용; 실제 encoder/imnet 구조/가중치는 resume 체크포인트에서 로드) -----
+#   encoder/imnet 은 freeze, add_layer(adapter)만 학습됨.
+model:
+  name: lte
+  args:
+    adapter_per_direction: true   # 방향별 adapter -> blend (models/liif_lte.py), HSR lte ft 와 동일
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: adapter
+      args:
+        out_dim: 1
+        hidden_dims:
+        - 128
+        - 64
+        - 128
+    extra_in_dim: 1   # topo 채널 수: elevation
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.001   # add_layer만 학습하므로 이전 MLP adapter 실험에서 안정적이었던 lr 재사용
+                # (1e-1은 constant로 붕괴, 1e-4는 극값을 눌러버림 - memory 기록 참고)
+
+# 주의: resume 체크포인트의 저장된 epoch(사전학습 epoch_max=20 기준 20)부터 이어서 epoch_start = 21 부터 시작.
+# epoch_max 는 저장된 epoch 보다 커야 하고(아니면 루프가 조용히 스킵), 실질 학습 epoch 수 = epoch_max - 저장된 epoch.
+# 체크포인트가 20 이 아니면 epoch_max 를 (저장 epoch + 300) 으로 맞출 것.
+epoch_max: 100   # 실질 300 epoch finetune (21~320)
+epoch_val: 1
+epoch_save: 10
+
+# ---- 손실: Wang, Tian & Carroll (2023, GMD 16, 535-556) Eq.1 ----
+# L = sum(w*|pred-gt|)/sum(w),  w = clip(y_true[mm], MIN, MAX)   (HSR wmae 런과 동일 설정)
+loss: wmae
+wmae:
+  w_min_mm: 1.0
+  w_max_mm: 30.0
+  normalize_by_weight: true

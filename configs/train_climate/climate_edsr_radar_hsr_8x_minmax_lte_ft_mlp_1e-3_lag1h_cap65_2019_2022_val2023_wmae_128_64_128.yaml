@@ -1,0 +1,154 @@
+# =====================================================================
+# [2026-10-05] 8x LTE + plain MLP adapter(128/64/128, 방향별 적용) + Weighted-MAE.  cap65 HSR 로 학습/검증 연도 확장.
+#   기반: ..._lte_ft_mlp_1e-3_lag1h_2019_2020_wmae.yaml (LTE 32/16/32 wmae) 에서 아래만 변경.
+#   - 입력/라벨 : HSR cap65 병합본 merge/HSR_2019_2023_JJA_merged_kst_hourly_2881x2305_cap65.nc 에서 만든 파일
+#       학습 = 2019~2022 JJA, 검증 = 2023 JJA  (2023-08 은 원본에 13시간 결손: 731/744 시간)
+#   - 어댑터 : hidden_dims 32/16/32 -> 128/64/128
+#   - base   : 기존 8x LTE base (cap53 로 사전학습, 정규화 최대값 74.8784) 그대로 이어받음.
+#   - 라벨   : non-vzero (ASOS 가 기록된 시각만), lag1h 정렬(ASOS[T] <-> radar[T-1h]).
+#   - epoch_save 1 -> 10 (디스크 절약; best/best-loss/last 는 그대로 저장됨)
+#
+#   주의 (정규화): physical_norm.max 는 기존 base 와 같은 74.8784 (=53 dBZ) 를 유지한다. cap65 데이터는 최대 421 mm/h 라
+#     정규화 값이 1 을 넘는다 (최대 ~5.6). base(LTE)는 [0,1] 에서만 사전학습돼 이 범위를 본 적 없음.
+#     또한 evaluate() 는 예측을 clamp(0,1) 해서 검증 지표(r/MAE/RMSE/heavy)는 74.88 mm/h 에서 잘림 (학습 손실은 clamp 없음).
+#     평가 스크립트(station_preds_dump_*)도 .clamp(0,1)*74.8784 이므로 극한 구간 평가 시 이 clamp 를 제거/조정할 것.
+#
+#   먼저 만들어야 하는 입력 파일 (아직 없음; 경로는 아래 yaml 에 그대로 사용):
+#     merge/HSR_2019_2022JJA_cap65_norm_8x_obscrop.nc   merge/HSR_2019_2022JJA_cap65_500m_norm_obscrop.nc
+#     merge/HSR_2023JJA_cap65_norm_8x_obscrop.nc        merge/HSR_2023JJA_cap65_500m_norm_obscrop.nc
+#       : cap65 병합본에서 해당 연도 JJA 선택 -> /74.8784 정규화(클리핑 없음, 변수명 precip_norm) -> 500m 그대로, 8x LR 은 기존 grid_8x 방식 리맵
+#         -> cdo sellonlatbox,124.2,131.4,32.7,38.8 (기존 obscrop 과 동일)
+#     hsr_obs/obs_hourly_HSR_500m_{2019_2022,2023}JJA_cap65_obscrop_lag1h_{train,val}.csv  및 meta_*.json
+#       : make_hsr_hourly_obs_2019_2020.py 와 같은 방식(lag1h, non-vzero)으로 2019~2022 / 2023 생성. meta 의 min_val/max_val 은 0 / 74.8784.
+#
+#   실행:
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_liif_finetune_vzero_wmae.py \
+#       --config configs/train_climate/climate_edsr_radar_hsr_8x_minmax_lte_ft_mlp_1e-3_lag1h_cap65_2019_2022_val2023_wmae_128_64_128.yaml \
+#       --gpu 2
+# ---------------------------------------------------------------------
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      # train을 2019-2020 -> 2019 JJA만으로 좁히고(cdo selyear,2019),
+      # ASOS 관측소 bbox+패딩(lon 124.2-131.4, lat 32.7-38.8)으로 한 번 더 crop
+      # (cdo sellonlatbox) -> 면적 약 25%로 줄어서 feat_unfold 메모리도 그만큼 절감.
+      # obs meta도 이 crop된 도메인 기준으로 새로 생성해서 좌표 정규화가 어긋나지 않음
+      # (전체 도메인 기준 좌표를 그대로 쓰면 grid_sample이 엉뚱한 위치를 가리키는
+      # 버그가 남 - latlon flip 버그와 같은 종류라 반드시 meta도 같이 crop 버전으로 교체).
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019_2022JJA_cap65_norm_8x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019_2022JJA_cap65_500m_norm_obscrop.nc
+      var_name: precip_norm
+      # 시스템 RAM 503GB 중 440GB 여유 확인 -> crop 후 파일이 더 작아져서(14.4GB+3.6GB) 더 여유있게 로드 가능.
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019_2022JJA_cap65_obscrop_lag1h_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019_2022JJA_cap65_obscrop_lag1h_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true      # ASOS 관측소 값이 GT. 날짜(시간)마다 지점 수가 달라 pad_collate 로 padding+mask.
+      sample_q: 1024        # obs_state=true 면 그리드 샘플이 관측소로 대체되어 사실상 미사용
+      augment: false
+      # pretrain은 inp_size=48 랜덤crop이라 feat_unfold가 48x48에서만 돌았는데, obs_state
+      # finetune은 원래 crop 없이 전체 이미지(지금은 663x617)를 매번 통째로 인코더에
+      # 태워서 그만큼 느렸음. inp_size를 다시 켜되, wrappers_ft.py를 고쳐서 관측소 중
+      # 하나를 anchor로 삼아 그 지점이 반드시 window 안에 들어오게 crop하고 좌표도
+      # window 기준으로 재정규화하도록 함 (그냥 랜덤 crop하면 관측소가 없는 빈 배치만
+      # 나올 확률이 높아서 이렇게 함).
+      # 48이었을 때 관측소 밀도상 window당 평균 <1개만 잡혀서(실측 30/30 trial 전부 1개)
+      # adapter가 신호 부족으로 거의 상수로 collapse함.
+      # inp_size를 192로 키워봤더니(면적 16배) epoch이 8.5분(300epoch=42시간)으로
+      # 너무 느려짐 - feat_unfold 비용이 면적에 비례해서 그대로 16배 걸림.
+      # 대신 patch는 48로 되돌리고 batch_size를 늘리는 게 훨씬 쌈: feat_unfold 비용은
+      # batch에는 "선형"으로만 붙어서, batch=64면 스텝당 평균 관측소 수(64*0.76≈49개)가
+      # inp_size=192(스텝당 8*4.2≈34개)보다 많으면서도 계산량은 훨씬 적음.
+      inp_size: 48
+  # patch crop(48x48) + batch_size를 키워서 스텝당 관측소 수 확보 -> pretrain급 속도 유지.
+  # sustained 학습에서 caching allocator 파편화가 있었으니 실행 시 여전히
+  #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 를 같이 쓸 것.
+  batch_size: 64
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2023JJA_cap65_norm_8x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2023JJA_cap65_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true   # train과 동일한 이유
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2023JJA_cap65_obscrop_lag1h_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2023JJA_cap65_obscrop_lag1h_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48   # train과 동일한 이유
+  batch_size: 32
+
+# pred/gt([0,1]) <-> mm/hour 변환. eval_psnr(PSNR) 계산에 사용.
+# meta 의 min_val/max_val 과 동일 => obs GT 도 이 값으로 denorm 가능.
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+# 이어서 학습할 사전학습 체크포인트 (마지막 에폭 = 500)
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_8x_minmax_lte/epoch-last.pth
+
+# ---- 모델 (참고용; 실제 encoder/imnet 구조/가중치는 resume 체크포인트에서 로드) -----
+#   encoder/imnet은 train_liif_finetune.py의 prepare_training()이 자동으로 freeze.
+#   add_layer(아래 layer_spec)만 학습됨.
+model:
+  name: lte
+  args:
+    adapter_per_direction: true   # LIIF 와 동일하게 방향별 adapter -> blend (models/liif_lte.py)
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: adapter
+      args:
+        out_dim: 1
+        hidden_dims:
+        - 128
+        - 64
+        - 128
+    # extra_in_dim 없음: topo_nc_path 미사용(model C는 topo 채널 없이 pretrain됨)
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.001   # add_layer만 학습하므로 이전 MLP adapter 실험에서 안정적이었던 lr 재사용
+                # (1e-1은 constant로 붕괴, 1e-4는 극값을 눌러버림 - memory 기록 참고)
+
+# epoch_max=4000/epoch_val=1은 IMERG 일간 데이터(적은 샘플 수)용 관례값을 그대로
+# 가져온 것. HSR은 epoch당 train 276 step + val 552 step(=828)이라 매 epoch validation은
+# 체감 속도를 거의 2배로 늦춤. adapter가 1169개 파라미터뿐이라 그렇게 많은 epoch도 불필요할
+# 것으로 보여 낮춤 (필요하면 나중에 log.txt의 psnr 추이 보고 다시 늘릴 것).
+# 주의: resume 체크포인트(8x pretrain epoch-last.pth)의 저장된 epoch 가 500 이라 epoch_start = 501 부터 시작.
+# epoch_max 는 반드시 500 보다 커야 하고(아니면 루프가 조용히 스킵), 실질 학습 epoch 수 = epoch_max - 500.
+epoch_max: 800   # 실질 300 epoch만큼 finetune (501~800)
+# patch crop(inp_size=48)으로 스텝당 65ms까지 빨라져서 매 epoch validation해도 부담 없음
+# -> 다시 1로 (val도 inp_size=48이라 552 step이어도 몇 초 수준).
+epoch_val: 1
+epoch_save: 10
+
+# ---- 손실: Wang, Tian & Carroll (2023, GMD 16, 535-556) Eq.1 ----
+# L = sum(w*|pred-gt|)/sum(w),  w = clip(y_true[mm/h], MIN, MAX)   (2x wmae 런과 동일 설정)
+loss: wmae
+wmae:
+  w_min_mm: 1.0
+  w_max_mm: 30.0
+  normalize_by_weight: true

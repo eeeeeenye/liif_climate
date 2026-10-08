@@ -1,0 +1,68 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_train_norm_8x.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_train_500m_norm.nc
+      var_name: precip_norm
+      load_into_memory: false   # HR 500m train nc가 117GB라 전체 메모리 로드 불가 (매 idx마다 disk read)
+      # topo_nc_path / obs_path_3: 아직 미사용 (pretrain 단계)
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 48   # LR(8x=4km, 361x289)에서 48x48 랜덤 crop -> HR ~383x383 (x8, 비율 기반 crop이라 384 아닌 383)
+      obs_state: false
+      sample_q: 1024
+      augment: true
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_val_norm_8x.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_val_500m_norm.nc
+      var_name: precip_norm
+      load_into_memory: false
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 48
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784   # 2x/4x 학습 때와 동일한 GMAX (HSR 원자료 기준 상수). 8x nc 도 이 값으로 정규화된 파일
+model:
+  name: liif
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    # extra_in_dim 없음: topo_nc_path 미사용이라 topo 채널 없음 (기본값 0)
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001   # resume 시 체크포인트의 optimizer state(lr 포함)로 덮어써짐
+# 4x로 학습 끝난 체크포인트(epoch 400)에서 이어서 8x->500m 학습.
+# resume 이라 epoch 은 401 부터 시작 -> epoch_max 는 반드시 400 보다 커야 함 (실질 100 epoch).
+# MultiStepLR 은 resume 시 epoch 만큼 step 을 돌리므로 milestone 을 400 이하로 두면 lr 이 또 반감됨 -> 450 만 사용.
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_4x_minmax_liif/epoch-last.pth
+epoch_max: 500
+multi_step_lr:
+  milestones: [450]
+  gamma: 0.5
+epoch_val: 1
+epoch_save: 1

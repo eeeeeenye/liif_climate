@@ -1,0 +1,75 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_train_norm_2x.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_train_500m_norm.nc
+      var_name: precip_norm
+      load_into_memory: false   # HR 500m train nc가 117GB라 전체 메모리 로드 불가 (매 idx마다 disk read)
+      # GMTED2010 250m 평균고도를 HSR 500m 격자(2881x2305)로 셀 평균한 지형. 변수명 elev, lat 오름차순(row0=남쪽)
+      # 생성: data/level/GMTED2010_korea/make_gmted_hsr500m_nc.py
+      topo_nc_path: /home/inhye_yoo/data/level/GMTED2010_korea/GMTED2010_mea075_hsr500m.nc
+      topo_kwargs:
+        lon_range: [119.0, 134.0]   # 기본값(124~132, 33~43)은 한반도용이라 HSR 영역(119.46~132.90 / 30.31~43.57)이 잘림
+        lat_range: [30.0, 44.0]
+        normalize: standard_tanh
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 48   # LR(2x, ~1153x1441)에서 48x48 랜덤 crop (DIV2K 관례와 동일)
+      obs_state: false
+      sample_q: 1024
+      augment: true   # topo 도 LR/HR 과 같이 flip/transpose 됨 (wrappers.py 에서 수정)
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_norm_2x.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_val_500m_norm.nc
+      var_name: precip_norm
+      load_into_memory: false
+      topo_nc_path: /home/inhye_yoo/data/level/GMTED2010_korea/GMTED2010_mea075_hsr500m.nc
+      topo_kwargs:
+        lon_range: [119.0, 134.0]
+        lat_range: [30.0, 44.0]
+        normalize: standard_tanh
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 48
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784   # split.sh 가 train(2019-2020 JJA)만으로 계산한 GMAX (data leakage 없음, val 도 동일 적용)
+model:
+  name: liif
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    extra_in_dim: 1   # topo(elev) 1채널을 query 좌표에서 grid_sample 해 imnet 입력에 concat
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+epoch_max: 300
+multi_step_lr:
+  milestones: [200, 400, 600, 800]
+  gamma: 0.5
+epoch_val: 1
+epoch_save: 1

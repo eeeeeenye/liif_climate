@@ -7,7 +7,7 @@ from models import register
 from utils import make_coord
 
 
-@register('liif')
+@register('liif_without_topo')
 class LIIF(nn.Module):
     def __init__(self, encoder_spec, imnet_spec=None,
                  local_ensemble=True, feat_unfold=True, cell_decode=True, extra_in_dim=0):

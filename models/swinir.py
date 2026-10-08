@@ -860,7 +860,29 @@ class SwinIR(nn.Module):
         return flops
 
 @register('swinir')
-def make_swinir(no_upsampling=False):
-    return SwinIR()
+def make_swinir(no_upsampling=True, in_chans=1, img_size=48, window_size=8,
+                img_range=1., depths=(6, 6, 6, 6, 6, 6), embed_dim=180,
+                num_heads=(6, 6, 6, 6, 6, 6), mlp_ratio=2.,
+                upscale=2, resi_connection='1conv'):
+    """
+    LIIF/LTE encoder 로 쓰는 SwinIR.
+
+    no_upsampling=True 이면 upsampler='none' 경로를 타서
+    (B, num_feat=64, H, W) feature map 을 반환 -> out_dim = 64.
+    (upscale 은 upsampler='none' 에서는 실제로 쓰이지 않지만 생성자 호환용으로 전달)
+    """
+    return SwinIR(
+        upscale=upscale,
+        in_chans=in_chans,
+        img_size=img_size,
+        window_size=window_size,
+        img_range=img_range,
+        depths=list(depths),
+        embed_dim=embed_dim,
+        num_heads=list(num_heads),
+        mlp_ratio=mlp_ratio,
+        upsampler='none' if no_upsampling else 'pixelshuffle',
+        resi_connection=resi_connection,
+    )
 
 

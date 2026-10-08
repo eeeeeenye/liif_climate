@@ -1,0 +1,96 @@
+# Reference-informed sparse-ASOS LTE+LoRA finetuning.
+# Keep the original r16/no_first configuration unchanged for a fair ablation.
+# Run from deeplearning/inr/liif:
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_lte_lora_asos.py \
+#   --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_refined.yaml --gpu 2
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 64
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 32
+
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+finetune_from: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_2x_minmax_lte/epoch-last.pth
+
+lora:
+  rank: 16
+  layers: no_first
+
+# Hayou et al. (2024, LoRA+): for the A-random/B-zero initialization,
+# use eta_B > eta_A.  Here B=2e-3 and A=5e-4.
+lora_plus:
+  enabled: true
+  b_lr_ratio: 4.0
+
+# Shi et al. (2017) balanced precipitation loss, adapted conservatively for
+# sparse ASOS gauges.  Huber protects against a single noisy extreme reading;
+# normalize_by_weight is built into balanced_huber.
+loss:
+  name: balanced_huber
+  args:
+    bins_mm_h: [2.0, 5.0, 10.0, 30.0]
+    weights: [1.0, 1.0, 2.0, 5.0, 10.0]
+huber_delta: 0.01
+rel_eps: 0.01
+
+# Li & Hoiem (2016) function-space preservation: retain base LTE responses
+# at random non-station queries using both ASOS-point and native raster cells.
+functional_distill:
+  weight: 0.05
+  sample_q: 128
+  loss: mse
+  cell_mode: both
+  grid_scale: 2
+
+val_seed: 0
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.002
+
+# The former run selected epoch 7 and deteriorated afterwards.  Preserve all
+# best checkpoints, and stop only after a sustained lack of val-loss progress.
+epoch_max: 200
+epoch_val: 1
+epoch_save: 5
+early_stopping:
+  patience: 25
+  min_delta: 0.0

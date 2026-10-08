@@ -1,0 +1,27 @@
+[HSR] 24h 모두 있는 UTC 날짜 273개 (20190601 ~ 20210830)
+[IMERG] LR 도메인 lat [33.0,42.9] lon [124.0,131.9] grid 100x80
+[HSR] crop grid 2144x1354 (lat[33.000,42.897] lon[124.002,131.897])
+[매칭] 최종 사용 날짜 273개
+  20/273  20190620  HR max so far 443.3 mm
+  40/273  20190710  HR max so far 736.9 mm
+  60/273  20190730  HR max so far 1301.2 mm
+  80/273  20190819  HR max so far 1301.2 mm
+  100/273  20200609  HR max so far 1301.2 mm
+  120/273  20200629  HR max so far 1301.2 mm
+  140/273  20200719  HR max so far 1301.2 mm
+  160/273  20200808  HR max so far 1301.2 mm
+  180/273  20200828  HR max so far 1301.2 mm
+  200/273  20210618  HR max so far 1301.2 mm
+  220/273  20210708  HR max so far 1301.2 mm
+  240/273  20210728  HR max so far 1301.2 mm
+  260/273  20210817  HR max so far 1301.2 mm
+  273/273  20210830  HR max so far 1301.2 mm
+[split] train 182일, val 91일 (그 외 0일은 미사용)
+[norm] train HR max=1301.16  train LR max=307.76  -> gmax=1301.1564 (min=0 고정)
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/HSR_daily_kor_crop_raw.nc (273, 2144, 1354) [mm/day raw]
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/IMERG_daily_kor_matched_raw.nc (273, 100, 80) [mm/day raw]
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/HR_train_norm.nc (182, 2144, 1354) [0~1]
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/HR_val_norm.nc (91, 2144, 1354) [0~1]
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/LR_train_norm.nc (182, 100, 80) [0~1]
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/LR_val_norm.nc (91, 100, 80) [0~1]
+saved /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/norm_meta.json

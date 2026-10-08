@@ -1,0 +1,92 @@
+# =====================================================================
+# 얼린 LTE 위에 거리 게이트(Gaussian-gated) attention 확률 adapter 학습.
+#   anp_adapter_lte_minmax.yaml 과 동일하나 model 만 gnp-adapter.
+#   ANP 가 관측소 구름 밖에서 폭주(코너 blob / 쐐기 아티팩트)하던 것을
+#   거리 게이트 + null token + density feature 로 억제.
+#   실행:
+#     python train_gnp_adapter.py \
+#       --config configs/train_climate/gnp_adapter_lte_minmax.yaml --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_1998_2009_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_1998_2009_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_1998_2009_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_2020_2022_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_2020_2022_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_2020_2022_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 506.01995849609375
+
+lte_from: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_topo_80x100_topo_minmax_lte/epoch-last.pth
+
+# ---- 거리 게이트 NP adapter (models/gnp_adapter.py) ----------------
+model:
+  name: gnp-adapter
+  args:
+    coord_dim: 2
+    y0_dim: 1
+    residual_dim: 1
+    enc_hidden: [128, 128]
+    r_dim: 128
+    kq_hidden: [128]
+    n_heads: 4
+    dec_hidden: [128, 128, 128]
+    length_scale_init: 0.3     # LIIF [-1,1] 좌표 단위. 도메인폭 2의 15% ~ 위도 1.5도
+    use_null: true             # 관측소 다 멀면 prior(보정 0)로 폴백
+    use_density: true          # 주변 관측 밀도를 decoder 에 알려줌
+    min_sigma: 1.0e-4
+    init_sigma_bias: -2.0
+
+loss:
+  name: gaussian_nll
+  args:
+    beta: 0.0
+loss_space: normalized
+
+context_target:
+  ctx_ratio: 0.6
+  min_context: 3
+  min_target: 2
+  val_split_seed: 1234
+
+optimizer:
+  name: adam
+  args:
+    lr: 1.0e-3
+
+epoch_max: 200
+epoch_val: 1
+epoch_save: 10

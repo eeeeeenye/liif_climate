@@ -1,0 +1,110 @@
+# =====================================================================
+# [2026-10-02] plainadapter 의 hidden_dims 32/16/32 -> 128/64/128 로 용량 확대 버전 (wmae MIN1/MAX30, lr 1e-3 동일). 학습 데이터 2019 -> 2019+2020 JJA (vzero 라벨 make_hsr_hourly_obs_vzero_2019_2020.py), 검증은 2021 그대로.
+#   2x 입력: 파일명은 ..._2019_2021_... 이지만 실제 시간축은 2019-06-01 ~ 2020-08-31 (4416 h) 로 500m 2019_2020 파일과 동일 -> 그대로 사용.
+#   동기: 이전 모델이 가중 MAE 이론 최적(HSR 구간별 가중중앙값)의 절반 수준(항등 근처)에 머묾.
+# model B(_climate_edsr_radar_hsr_2x_minmax_liif) finetune: ASOS 시간별 관측으로
+# MLP correction layer(adapter)만 학습 (encoder/imnet은 freeze).
+#   [plain adapter + Weighted-MAE 버전, 2026-09-22]
+#   climate_edsr_radar_hsr_2x_minmax_liif_ft_mlp_1e-3_lag1h_vzero_wmae.yaml 과
+#   데이터/손실은 동일하고, layer_spec만 adapter_res(잔차+항등초기화) 대신
+#   plain adapter(랜덤 초기화)로 바꾼 버전.
+#
+#   주의: vzero 라벨은 0.0이 80%(97,489건 중 78,000여건)라서, 랜덤 초기화 MLP adapter를
+#   wmae로 학습시키면 과거 실험에서 1 epoch 만에 "전부 0" 상수로 붕괴했음
+#   (heavy ratio 0.01로 급락). adapter_res(항등 초기화, zero_anchor)로 바꿔서 해결한 전례가
+#   있음 -> project_liif_hsr_vzero_wmae_finetune 메모 참고. 이 config는 plain adapter로
+#   같은 붕괴가 재현되는지 확인/비교하는 용도. epoch 1~2 log.txt의 val heavy ratio를
+#   바로 확인해서 붕괴 조짐(=0 근처로 수렴)이 보이면 조기 중단할 것.
+#
+#   실행:
+#     python train_liif_finetune_vzero_wmae.py \
+#       --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_liif_ft_mlp_1e-3_lag1h_vzero_wmae_plainadapter_128_64_128.yaml \
+#       --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_train_norm_2x_obscrop_JJA_2019_2021_1440x1152.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019_2020JJA_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019_2020JJA_obscrop_lag1h_vzero_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019_2020JJA_obscrop_lag1h_vzero_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 64
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_vzero_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_vzero_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 32
+
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_2x_minmax_liif/epoch-last.pth
+
+# ---- 모델 (참고용; 실제 encoder/imnet 구조/가중치는 resume 체크포인트에서 로드) -----
+model:
+  name: liif
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: adapter   # plain MLP adapter (랜덤 초기화) - adapter_res 아님, 붕괴 위험 있음(상단 주의 참고)
+      args:
+        out_dim: 1
+        hidden_dims:
+        - 128
+        - 64
+        - 128
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.001   # 기존 MLP adapter 실험에서 안정적이었던 lr (1e-1 붕괴 / 1e-4 극값 억제 - memory 참고)
+
+epoch_max: 500   # resume 300 epoch -> 실질 200 epoch finetune (301~500)
+epoch_val: 1
+epoch_save: 10
+
+# ---- 손실: Wang, Tian & Carroll (2023, GMD 16, 535-556) Eq.1 ----
+# L = sum(w*|pred-gt|)/sum(w),  w = clip(y_true[mm/h], MIN, MAX)
+loss: wmae
+wmae:
+  w_min_mm: 1.0
+  w_max_mm: 30.0
+  normalize_by_weight: true

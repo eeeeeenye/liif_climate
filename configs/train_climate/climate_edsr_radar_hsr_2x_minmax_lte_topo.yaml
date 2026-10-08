@@ -1,0 +1,79 @@
+# HSR 2x LTE pretrain + 지형(GMTED2010) -- liif_no_correction_layer 의 지형 처리 방식
+#   학습 = 2019~2022 JJA, 검증 = 2023 JJA (cap65clip: cap65 병합본 /74.8784 정규화 후 1 로 clip, 관측소 영역 obscrop)
+#   LR/HR 는 merge/ 의 HSR_2019_2022JJA_cap65clip_*_obscrop.nc / HSR_2023JJA_cap65clip_*_obscrop.nc, 지형은 GMTED2010 원본
+#   (2x LR 파일은 make_lr2x_obscrop_cap65clip.sh 로 생성되는 중일 수 있음 -> 학습 전에 4개 파일 존재 확인)
+#   지형: 원본 GMTED 를 LR 격자 위경도에 맞춰 nearest 리샘플(align_to_lr), augment 시 LR/HR/지형 같이 변환
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_2019_2022JJA_cap65clip_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019_2022JJA_cap65clip_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: false   # HR 500m obscrop train nc 가 61GB (매 idx 마다 disk read). RAM 여유가 크면 true 로 바꿔 속도 향상 가능
+      # GMTED2010 250m 평균고도 원본(regrid 안 함, 124~132E / 33~43N, 4800x3840). 변수명 elev, lat 오름차순(row0=남쪽)
+      topo_nc_path: /home/share/radar_precip_KMA/GMTED2010_mea075_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+        align_to_lr: true   # 지형을 LR nc 위경도에 맞춰 리샘플 (기본 4x -> LR 픽셀당 4x4)
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 48   # LR(2x, ~1153x1441)에서 48x48 랜덤 crop (DIV2K 관례와 동일)
+      obs_state: false
+      sample_q: 1024
+      augment: true   # topo 도 LR/HR 과 같이 flip/transpose 됨
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_2023JJA_cap65clip_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2023JJA_cap65clip_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: false
+      topo_nc_path: /home/share/radar_precip_KMA/GMTED2010_mea075_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+        align_to_lr: true   # 지형을 LR nc 위경도에 맞춰 리샘플 (기본 4x -> LR 픽셀당 4x4)
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 48
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784   # split.sh 가 train(2019-2020 JJA)만으로 계산한 GMAX (data leakage 없음, val 도 동일 적용)
+model:
+  name: lte
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    extra_in_dim: 1   # topo(elev) 1채널을 query 좌표에서 grid_sample 해 imnet 입력(LTE 푸리에 feature 뒤)에 concat
+    # layer_spec(adapter) 미사용: pretrain 단계라 correction_layer 항등 함수로 동작
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+epoch_max: 300
+multi_step_lr:
+  milestones: [200, 400, 600, 800]
+  gamma: 0.5
+# resume 없음: LTE 는 from scratch (liif 체크포인트와 파라미터 구조가 다름)
+epoch_val: 1
+epoch_save: 1

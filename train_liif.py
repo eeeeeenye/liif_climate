@@ -87,52 +87,17 @@ def make_data_loaders():
 def prepare_training():
     # pretrained checkpoint에서 이어서 학습하는 경우
     if config.get('resume') is not None:
-        # checkpoint 불러오기
         sv_file = torch.load(config['resume'])
-
-        # 저장된 model state_dict 가져오기
-        pretrained_sd = sv_file["model"]["sd"]
-
-        # config에 적힌 모델 구조 생성 후 GPU로 이동
-        model = models.make(config["model"]).cuda()
-
-        # pretrained weight 로드
-        # strict=False이므로 구조가 일부 달라도 로드 가능
-        missing, unexpected = model.load_state_dict(pretrained_sd, strict=False)
-
-        # 로드되지 않은 key, 예상 밖 key 확인
-        print("missing keys:", missing)
-        print("unexpected keys:", unexpected)
-
-        # encoder는 freeze
-        # 학습 중 weight 업데이트 안 됨
-        for p in model.encoder.parameters():
-            p.requires_grad = False
-
-        # imnet도 freeze
-        for p in model.imnet.parameters():
-            p.requires_grad = False
-
-        # add_layer만 학습  (2026년 6월 이후 업데이트)
-        for p in model.add_layer.parameters():
-            p.requires_grad = True
-
-        # optimizer는 add_layer 파라미터만 받음
+        model = models.make(sv_file['model'], load_sd=True).cuda()
         optimizer = utils.make_optimizer(
-            model.add_layer.parameters(),
-            config['optimizer']
-        )
-
-        # epoch은 1부터 새로 시작
-        epoch_start = 1
-
-        # learning rate scheduler가 없으면 None
+            model.parameters(), sv_file['optimizer'], load_sd=True)
+        epoch_start = sv_file['epoch'] + 1
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
         else:
-            # 특정 epoch에서 learning rate 감소
             lr_scheduler = MultiStepLR(optimizer, **config['multi_step_lr'])
-
+        for _ in range(epoch_start - 1):
+            lr_scheduler.step()
     # resume이 없는 경우: 처음부터 전체 모델 학습
     else:
         # 모델 생성
@@ -157,74 +122,47 @@ def prepare_training():
 
 
 def train(train_loader, model, optimizer):
-    # train mode
-    # Dropout/BatchNorm 등이 학습 모드로 동작
     model.train()
 
-    # L1 loss 사용
-    # pred와 gt의 절댓값 차이 평균
     loss_fn = nn.L1Loss()
-
-    # loss 평균 계산용 객체
     train_loss = utils.Averager()
 
-    # normalization 설정 가져오기
-    data_norm = config['data_norm']
-
-    # input normalization 값
-    # shape: (1, C, 1, 1)
-    # 이미지 채널별 정규화를 위해 broadcasting 가능하게 만듦
-    t = data_norm['inp']
-    inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
-    inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
-
-    # gt normalization 값
-    # shape: (1, 1, C)
-    # gt는 보통 (B, N, C)이므로 broadcasting 가능하게 만듦
-    t = data_norm['gt']
-    gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
-    gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
-
-    # batch 단위 학습
     for batch in tqdm(train_loader, leave=False, desc='train'):
 
-        # batch 안의 모든 tensor를 GPU로 이동
+        # Tensor만 GPU로 이동
         for k, v in batch.items():
-            batch[k] = v.cuda()
+            if torch.is_tensor(v):
+                batch[k] = v.cuda(non_blocking=True)
 
-        # 입력 이미지 정규화
+        # NetCDF에 이미 z-score 전처리가 되어 있으므로 그대로 사용
+        data_norm = config['data_norm']
+
+        t = data_norm["inp"]
+        inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
+        inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
+
+        t = data_norm['gt']
+        gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
+        gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
+
         inp = (batch['inp'] - inp_sub) / inp_div
-
-        # 모델 forward
-        # inp: low-resolution input image
-        # level: scale 또는 추가 조건 정보로 보임
-        # coord: query coordinate
-        # cell: query cell size
-        pred = model(inp, batch['level'], batch['coord'], batch['cell'])
-
-        # ground truth 정규화
         gt = (batch['gt'] - gt_sub) / gt_div
 
-        # prediction과 gt 사이 loss 계산
+        pred = model(
+            inp,
+            batch.get('level'),  # topo_nc_path 없는 config면 wrapper가 'level' 키를 안 넣으므로 None
+            batch['coord'],
+            batch['cell']
+        )
+
         loss = loss_fn(pred, gt)
 
-        # loss 평균에 추가
         train_loss.add(loss.item())
 
-        # 이전 gradient 초기화
         optimizer.zero_grad()
-
-        # backpropagation
         loss.backward()
-
-        # parameter update
         optimizer.step()
 
-        # 메모리 정리용
-        pred = None
-        loss = None
-
-    # epoch 전체 평균 train loss 반환
     return train_loss.item()
 
 
@@ -354,7 +292,7 @@ def main(config_, save_path):
             val_res, val_loss = eval_psnr(
                 val_loader,
                 model_,
-                data_norm=config['data_norm'],
+                physical_norm=config['physical_norm'],
                 eval_type=config.get('eval_type'),
                 eval_bsize=config.get('eval_bsize')
             )

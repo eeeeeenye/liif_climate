@@ -1,0 +1,60 @@
+LIIF 본체 직접 파인튜닝 (ASOS 만, adapter / correction layer 없음) — 수정 내역
+작성: 2026-09-19
+
+[목적]
+adapter 를 붙이고 encoder/imnet 을 얼리던 기존 방식 대신, adapter 없이 사전학습된 HSR 2x LIIF
+(_climate_edsr_radar_hsr_2x_minmax_liif, epoch 300) 의 가중치 자체를 ASOS 시간별 관측만으로 파인튜닝.
+
+[새로 만든 파일 (기존 파일은 하나도 수정하지 않음)]
+1) train_liif_finetune_asos.py
+   - train_liif_finetune.py 를 베이스로 하되 adapter 관련 로직 제거.
+   - 모델 구조는 finetune_from 체크포인트에 저장된 spec 을 그대로 사용.
+     체크포인트 spec 에 layer_spec 이 있거나 모델에 add_layer 가 붙어 있으면 즉시 에러.
+   - config `trainable`:
+       imnet (기본) -> EDSR encoder 동결, imnet MLP 만 학습 (788,737 / 전체 39,146,521 param)
+       all          -> encoder 까지 전부 학습
+   - config `loss`: mse(기본) | l1. [0,1] 정규화 공간, pad mask=1 인 실제 관측소만 평균.
+   - pad_collate 는 train_liif_finetune.py 것을 import 해서 재사용 (level=None 처리 포함).
+   - 학습 시작 전에 사전학습 모델의 val 을 "epoch 0" 으로 로그에 남김 -> 파인튜닝 효과를 바로 비교.
+   - 정규화 공간 손실이 1e-3~1e-4 수준이라 로그를 지수 표기(.4e)로 변경 (기존 {:.4f} 는 0.0000 으로 보임).
+   - 저장: epoch-last / epoch-N / epoch-best-psnr / epoch-best-loss (.pth), tensorboard 에 train/val loss 둘 다 기록.
+   - reset_epoch: true(기본) 면 epoch 1 부터 번호를 새로 시작.
+
+2) configs/train_climate/climate_edsr_radar_hsr_2x_minmax_liif_ft_asos_lag1h.yaml
+   - 데이터/obs csv/meta/physical_norm 은 ft_mlp_1e-3_lag1h 와 완전히 동일
+     (ASOS[T] <-> radar[T-1h] 정렬본, obscrop 도메인, val 은 merge/regrid/ obscrop nc).
+   - 기존 config 와의 차이:
+       resume            -> finetune_from (같은 사전학습 체크포인트)
+       model / layer_spec 블록 제거 (체크포인트 spec 사용)
+       trainable: imnet, loss: mse 추가
+       optimizer lr: 1e-5 (adapter 실험의 1e-3 보다 훨씬 작게 — 사전학습 가중치를 직접 움직이므로)
+       reset_epoch: true, epoch_max: 50 (= 실제 학습 epoch 수)
+
+[왜 기존 스크립트를 안 쓰고 새로 만들었나]
+- train_liif_finetune.py : prepare_training() 이 `model.add_layer is not None` 을 바로 참조하므로
+  add_layer 가 없으면 AttributeError. 또 encoder/imnet 을 무조건 동결해서 학습할 게 없음.
+- train_liif_finetune_weighted_mae.py : pad_collate 가 level 을 torch.stack 하므로 topo 없는 HSR
+  (level=None) 에서 죽음.
+
+[스모크 테스트 (GPU 2, 1 epoch, 결과 폴더는 삭제함)]
+- epoch 0 (파인튜닝 전): val psnr 34.66, val loss(MSE, norm) 1.542e-3
+- epoch 1              : train loss 9.64e-4, val psnr 35.34, val loss 1.344e-3   (~24 s/epoch)
+- 주의: val 은 inp_size 48 랜덤 crop 이라 실행/epoch 마다 표본이 달라 절대값 비교는 노이즈가 있음.
+  같은 실행 안에서 epoch 0 대비 추세로 볼 것.
+
+[실행 (사용자가 직접)]
+  cd /home/inhye_yoo/deeplearning/inr/liif
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_liif_finetune_asos.py \
+    --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_liif_ft_asos_lag1h.yaml --gpu 2
+  결과: save/_climate_edsr_radar_hsr_2x_minmax_liif_ft_asos_lag1h/
+
+[실험 변형]
+  - loss l1 : config 의 `loss: l1`
+  - encoder 까지 : `trainable: all` + lr 1e-5 이하 권장 (ASOS 소수 지점 과적합 위험)
+  - lr 이 너무 작아 안 움직이면 5e-5 -> 1e-4
+  - 이 모델은 지점 수가 적어 과적합하기 쉬움 -> val loss 가 오르기 시작하면 epoch-best-loss.pth 사용
+
+[미확인 / 유의]
+  - HSR 2x 사전학습 모델 기준으로 작성함 (IMERG 강수 모델이 아님). IMERG 쪽으로 하려면 config 만 바꾸면 됨.
+  - 파인튜닝 후 레이더 격자 전체 출력이 관측소 밖에서 어떻게 변하는지(과보정/공간 아티팩트)는 별도 추론으로 확인 필요.
+    관측소 지점 loss 만 줄이면 지점 사이가 망가질 수 있음.

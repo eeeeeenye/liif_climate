@@ -1,0 +1,96 @@
+# =====================================================================
+# 얼린 LTE(_climate_edsr_topo_80x100_topo_minmax_lte) 위에
+# 확률적 CNP adapter 학습.
+#   Y0 = LTE(IMERG, x)  (동결)
+#   e_i = y_i^ASOS - Y0(s_i)
+#   p(dy_t | x_t, C) = N(mu, sigma^2)   -> Gaussian NLL
+#   실행:
+#     python train_cnp_adapter.py \
+#       --config configs/train_climate/cnp_adapter_lte_minmax.yaml --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_1998_2009_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_1998_2009_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_1998_2009_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true       # ASOS 관측소 값이 GT. wrapper 가 위경도 flip 교정 적용.
+      sample_q: 1024         # obs_state=true 면 미사용
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_2020_2022_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_2020_2022_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_2020_2022_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+
+# pred/gt([0,1]) <-> mm/day. NLL/RMSE 스케일 변환에 사용 (meta min/max 와 동일).
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 506.01995849609375
+
+# 얼릴 LTE 체크포인트 (correction layer 없는 순수 LTE)
+lte_from: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_topo_80x100_topo_minmax_lte/epoch-last.pth
+
+# ---- 확률적 CNP adapter (models/cnp_adapter.py) ----------------------
+model:
+  name: cnp-adapter
+  args:
+    coord_dim: 2
+    y0_dim: 1
+    residual_dim: 1
+    enc_hidden: [128, 128]
+    r_dim: 128
+    dec_hidden: [128, 128, 128]
+    min_sigma: 1.0e-4
+    init_sigma_bias: -2.0     # 초기 sigma 를 작게 -> NLL 초기 발산 완화
+
+# ---- Gaussian NLL (losses_cnp.py) ----------------------------------
+loss:
+  name: gaussian_nll
+  args:
+    beta: 0.0                 # 0=순수 NLL. 분산추정 불안정하면 0.5 시도(beta-NLL).
+loss_space: normalized       # 'normalized'([0,1], 수치 안정) | 'physical'(mm/day)
+
+# ---- CNP context/target split -------------------------------------
+context_target:
+  ctx_ratio: 0.6             # 유효 ASOS 중 60% context, 40% target (disjoint)
+  min_context: 3
+  min_target: 2
+  val_split_seed: 1234       # val 은 고정 분할 -> epoch 간 비교 가능
+
+optimizer:
+  name: adam
+  args:
+    lr: 1.0e-3               # adapter 소규모라 1e-3 부터. 불안정하면 3e-4.
+
+# multi_step_lr:
+#   milestones: [120, 170]
+#   gamma: 0.5
+
+epoch_max: 200
+epoch_val: 1
+epoch_save: 10

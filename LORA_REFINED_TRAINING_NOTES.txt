@@ -1,0 +1,203 @@
+Reference-informed LTE + LoRA refinement for sparse ASOS supervision
+=====================================================================
+
+Purpose
+-------
+The original 2x LTE + LoRA r16/no_first run optimizes a relative-L2 loss on
+sparse ASOS point observations. It reduces mean bias, but the training log
+shows that the crop-based validation objective and MAE/correlation can move in
+different directions. The refined path aims to improve heavy-rain skill and
+retain the pretrained LTE spatial field while keeping the original experiment
+unchanged for a fair comparison.
+
+Files changed
+-------------
+1. train_lte_lora_asos.py
+   - Added LoRA+ parameter groups: lr(B) > lr(A).
+   - Added balanced_huber station loss with target-rainfall bins in mm/hr.
+   - Added function-space distillation at random non-station point queries:
+       L_total = L_balanced_huber(ASOS) + lambda * MSE(f_LoRA(q), f_base(q))
+     Base targets are no-grad and LoRA is temporarily disabled. Half of the
+     random queries use the ASOS point cell (2/1000), and half use the native
+     2x raster cell, because LTE uses cell in its phase term.
+   - Logs rainfall-bin MAE/bias and saves best-loss, best-MAE, best-|bias|,
+     and best-r checkpoints. It also saves the unadapted B=0 `epoch-base.pth`
+     and initializes every best criterion from it, so sparse fine-tuning has
+     a true no-adaptation fallback. Optional early stopping is now supported.
+   - Runs validation under `torch.no_grad()` so metrics are detached safely and
+     validation does not retain unnecessary autograd memory.
+
+2. configs/train_climate/
+   climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_refined.yaml
+   - New, separate experiment configuration. The old config was not edited.
+
+New configuration choices
+-------------------------
+- LoRA+: B lr = 2e-3, A lr = 5e-4 (B/A = 4).
+- balanced_huber bins: <2, 2-5, 5-10, 10-30, >=30 mm/hr.
+  Sparse-gauge-safe weights: [1, 1, 2, 5, 10]. The weighted loss is divided
+  by sum(valid-mask * weight), so its magnitude does not depend on a batch's
+  rainfall composition.
+- Function-space preservation: 128 random queries/crop, lambda = 0.05, with
+  both ASOS-point and raster-grid cell modes preserved. `grid_scale: 2` makes
+  the raster cell match this 2x experiment; set it explicitly for 4x/8x reuse.
+- Early stopping: patience 25 validation epochs. This is a guardrail, not a
+  claim that epoch 25 is optimal.
+
+References used
+---------------
+0. Truong et al. (2025), Low-Rank Adaptation of Neural Fields.
+   https://arxiv.org/abs/2504.15933
+   The original LTE-imnet LoRA design follows this neural-field adaptation
+   setting; the refinements below keep its frozen-base, low-rank premise.
+
+1. Hu et al. (2021), LoRA: Low-Rank Adaptation of Large Language Models.
+   https://arxiv.org/abs/2106.09685
+   Basis for frozen base weights plus trainable low-rank A/B updates.
+
+2. Hayou, Ghosh, and Yu (2024), LoRA+: Efficient Low Rank Adaptation of
+   Large Models, ICML 2024.
+   https://proceedings.mlr.press/v235/hayou24a.html
+   Motivates separate A/B learning rates. The paper finds lr(B) > lr(A) is
+   beneficial for the A-random/B-zero initialization used here. Ratio 4 is a
+   conservative starting point and must still be validated for this model.
+
+3. Li and Hoiem (2016), Learning without Forgetting, ECCV 2016.
+   https://arxiv.org/abs/1606.09282
+   Motivates preserving pretrained model outputs while learning from new,
+   sparse supervision. Here this becomes pointwise base-LTE distillation at
+   unlabelled coordinates, protecting the spatial field between ASOS gauges.
+
+4. Shi et al. (2017), Deep Learning for Precipitation Nowcasting: A Benchmark
+   and A New Model, NeurIPS 2017.
+   https://proceedings.neurips.cc/paper/7145-deep-learning-for-precipitation-nowcasting-a-benchmark-and-a-new-model.pdf
+   Introduces intensity-balanced precipitation losses and reports that they
+   improve high-rainfall skill. The mm/hr thresholds derive from this paper.
+   Our weights are intentionally milder because ASOS supervision is sparse.
+
+5. Wang, Tian, and Carroll (2023), Customized deep learning for precipitation
+   bias correction and downscaling, Geoscientific Model Development 16,
+   535-556.
+   https://doi.org/10.5194/gmd-16-535-2023
+   Supporting evidence for target-intensity-weighted robust precipitation
+   regression. Its capped weighted-MAE is retained as a future ablation, not
+   combined with the refined default so the objective remains interpretable.
+
+How to run
+----------
+cd /home/inhye_yoo/deeplearning/inr/liif
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python train_lte_lora_asos.py \
+  --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_refined.yaml \
+  --gpu 2
+
+For the intended 2019+2020 JJA training period, first create the matching
+2x ASOS-cropped input (about 7 GB; do this while no competing I/O-heavy run is
+active), then use the separate configuration:
+
+bash /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/codes/make_2019_2020_2x_obscrop.sh
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python train_lte_lora_asos.py \
+  --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_refined_2019_2020.yaml \
+  --gpu 2
+
+The original `_refined.yaml` intentionally remains as the 2019-only ablation.
+Do not substitute the existing 8x input for this 2x LTE model: input scale
+would change from 1 km to 4 km and invalidate the comparison.
+
+The default save directory is:
+save/_climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_refined/
+
+Required validation before claiming an improvement
+--------------------------------------------------
+Do not choose a checkpoint solely from the cropped validation loss. Compare
+epoch-base.pth, epoch-best-loss.pth, epoch-best-mae.pth,
+epoch-best-abs-bias.pth, and epoch-best-corr.pth using the
+existing full-station validation script and the same 2021/2022 hold-outs:
+
+CUDA_VISIBLE_DEVICES=2 python inference_tools/codes/station_metrics_val2021_lte_lora.py \
+  save/_climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_refined/epoch-best-loss.pth \
+  inference_tools/station_metrics_val2021_lte_lora_refined_bestloss.csv
+
+Report global MAE, |bias|, RMSE, r and the five rainfall bins printed by the
+trainer. Also redraw the 2022-08-08 out-of-sample case before selecting a
+production checkpoint.
+
+Suggested small ablation grid
+-----------------------------
+Keep rank/no_first fixed, change one item at a time:
+  A. original loss + ordinary LoRA
+  B. original loss + LoRA+
+  C. balanced_huber + LoRA+
+  D. balanced_huber + LoRA+ + function distillation (refined default)
+
+For D, tune only lambda in {0.01, 0.03, 0.05, 0.10}. If station MAE/r does
+not improve, reduce lambda before changing rank. If heavy-rain bins remain
+underpredicted, compare the conservative weights with Shi et al.'s original
+[1, 2, 5, 10, 30] rather than silently changing several variables at once.
+
+Absolute-coordinate residual experiment
+---------------------------------------
+`climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_globalresid.yaml`
+adds one intentionally separate ablation.  It exists because the LTE imnet
+receives coordinates after every 48x48 crop has been normalized back to
+[-1, 1].  Therefore, the same local coordinate can refer to different physical
+places in Korea; ordinary crop-local LoRA cannot represent a persistent
+location-specific radar--gauge offset cleanly.
+
+The new path is:
+
+    frozen LTE + crop-local LoRA prediction
+      + station-gated bounded residual(base prediction, whole-domain y/x)
+
+The residual input combines the unmodified base prediction with Fourier
+features of the whole-domain y/x coordinate.  `wrappers_ft.py` forwards that
+second coordinate only when `return_global_coord: true`; LTE itself continues
+to see its original crop-local coordinate.  A Gaussian gate based on the ASOS
+site coordinates limits the correction to station-near regions.  The residual
+MLP's final layer is initialized to zero, so `epoch-base.pth` is exactly the
+unadapted LTE output.  Function-space distillation also constrains the
+residual at random grid locations.
+
+Start with `max_delta_norm: 0.20` (at most 14.98 mm/h under this min--max
+normalization), `gate_radius_norm: 0.15`, and the separate residual LR of
+1e-3.  Do not claim a map-wide correction from this run: it is a
+station-conditioned calibration experiment, and its full-grid influence must
+be checked separately on the 2021/2022 cases.
+
+Additional references for this ablation:
+
+6. Liu et al. (2018), An Intriguing Failing of Convolutional Neural Networks
+   and the CoordConv Solution, NeurIPS 2018.
+   https://proceedings.neurips.cc/paper/2018/hash/60106888f8977b71e1f15db7bc9a88d1-Abstract.html
+   Explicit coordinates allow a convolutional representation to distinguish
+   otherwise identical local patterns at different absolute locations.
+
+7. Tancik et al. (2020), Fourier Features Let Networks Learn High Frequency
+   Functions in Low Dimensional Domains, NeurIPS 2020.
+   https://papers.neurips.cc/paper_files/paper/2020/file/55053683268957697aa39fba6f231c68-Paper.pdf
+   Supports the low-dimensional Fourier y/x encoding used by the residual
+   head.  The small band set is a regularized starting point, not a claim that
+   high-frequency spatial bias is identifiable from sparse gauges.
+
+8. García-Pintado et al. (2009), A geostatistical approach to real-time radar
+   rainfall field bias correction and uncertainty estimation.
+   https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2008WR007011
+   Provides the radar--gauge motivation for spatially local additive and
+   multiplicative corrections.  The station-distance gate is a conservative
+   neural analogue; it is not presented as a replacement for geostatistical
+   radar--gauge merging.
+
+Important limitation
+--------------------
+These changes are literature-motivated, not a guarantee of higher performance.
+The cited precipitation studies mostly use dense radar grids; sparse ASOS
+gauges have different noise and sampling properties. The full-station,
+out-of-sample evaluation above is the acceptance criterion.
+
+The refined configuration deliberately keeps `augment: false`. In the current
+wrapper, enabling spatial flips/transposes would also require transforming
+station coordinates (and topo); do not enable augmentation until that separate
+coordinate-consistency change has been tested. The pre-existing station/crop
+coordinate convention should likewise be verified with a station-to-raster
+round-trip test before interpreting edge-station spatial errors.

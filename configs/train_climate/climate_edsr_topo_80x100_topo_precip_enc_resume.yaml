@@ -1,0 +1,78 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/climate/climate_train_korea_imerg40x50_1998_2002
+      root_path_2: ./load/climate/climate_train_korea_imerg80x100_1998_2002
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired-topo-enc
+    args:
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/climate/climate_val_korea_imerg40x50_2020_2022
+      root_path_2: ./load/climate/climate_val_korea_imerg80x100_2020_2022
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired-topo-enc
+    args:
+      sample_q: 1024
+      obs_state: false
+      augment: false
+  batch_size: 16
+data_norm:
+  inp:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+  gt:
+    sub:
+    - 0.5
+    div:
+    - 0.5
+model:
+  name: liif_topo_encoder
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    topo_encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+        n_feats: 16
+        n_resblocks: 4
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+epoch_max: 1000
+multi_step_lr:
+  milestones:
+  - 200
+  - 400
+  - 600
+  - 800
+  gamma: 0.5
+epoch_val: 1
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_topo_80x100_topo_precip_no_patch/epoch-last.pth
+epoch_save: 1

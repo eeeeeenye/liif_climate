@@ -1,0 +1,107 @@
+# =====================================================================
+# _climate_edsr_radar_hsr_2x_minmax_lte_topo_cap63clip  파인튜닝 (2026-10-06)
+#   - 라벨: 검증된 무강수(vzero) lag1h ASOS 시간별 obs.  손실: Weighted-MAE (Wang, Tian & Carroll 2023 Eq.1)
+#   - 학습 2019~2022 JJA / 검증 2023 JJA
+#   - 학습 대상: 항등초기화 잔차 adapter(adapter_res) + LTE 의 coef / freq / phase  (encoder, imnet 만 freeze; adapter_only 아님)
+#       adapter lr = optimizer.args.lr, coef/freq/phase lr = lr_pretrained (사전학습 표현 보호용으로 더 작게)
+#   - topo(GMTED) 입력은 사전학습과 동일 (extra_in_dim 1, standard_tanh, align_to_lr)
+#   obs 생성: data/observation/raw/ASOS/hourly/preprocessing_codes/make_hsr_hourly_obs_vzero_2019_2022.py
+#   실행:
+#     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_liif_finetune_vzero_wmae_lte.py \
+#       --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_lte_topo_cap63clip_ft_vzero_wmae_2019_2022.yaml --gpu 2
+# =====================================================================
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_2019_2022JJA_cap63clip_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019_2022JJA_cap63clip_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: false   # HR 500m 이 61GB 라 사전학습과 동일하게 디스크에서 읽음
+      topo_nc_path: /home/share/radar_precip_KMA/GMTED2010_mea075_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+        align_to_lr: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019_2022JJA_obscrop_lag1h_vzero_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019_2022JJA_obscrop_lag1h_vzero_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 64
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_2023JJA_cap63clip_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2023JJA_cap63clip_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: false
+      topo_nc_path: /home/share/radar_precip_KMA/GMTED2010_mea075_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+        align_to_lr: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2023JJA_obscrop_lag1h_vzero_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2023JJA_obscrop_lag1h_vzero_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 32
+
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+# 사전학습 체크포인트(저장 epoch=300 -> 이어서 301 부터; epoch_max 는 300 보다 커야 하고 실질 epoch = epoch_max-300)
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_2x_minmax_lte_topo_cap63clip/epoch-last.pth
+
+model:
+  name: lte
+  args:
+    adapter_per_direction: true
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: adapter_res
+      args:
+        out_dim: 1
+        hidden_dims:
+        - 32
+        - 16
+        - 32
+    extra_in_dim: 1
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.001          # adapter
+lr_pretrained: 0.0001  # coef / freq / phase (사전학습 lr 와 동일)
+
+epoch_max: 400         # 301~400, 실질 100 epoch
+epoch_val: 1
+epoch_save: 5
+
+loss: wmae
+wmae:
+  w_min_mm: 1.0
+  w_max_mm: 30.0
+  normalize_by_weight: true

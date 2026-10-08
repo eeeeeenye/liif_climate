@@ -1,0 +1,105 @@
+# Absolute-coordinate residual ablation on the existing 2019-JJA LoRA setup.
+# GPU 2 only:
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python train_lte_lora_asos.py \
+#   --config configs/train_climate/climate_edsr_radar_hsr_2x_minmax_lte_lora_r16_nofirst_asos_lag1h_globalresid.yaml --gpu 2
+#
+# Base LTE still sees only crop-local coordinates.  The added residual receives
+# whole-domain coordinates and is station-distance gated; its final layer is
+# initialized to zero, so epoch 0 is exactly the unadapted LTE baseline.
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      return_global_coord: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 64
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      return_global_coord: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48
+  batch_size: 32
+
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+finetune_from: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_2x_minmax_lte/epoch-last.pth
+
+lora:
+  rank: 16
+  layers: no_first
+
+lora_plus:
+  enabled: true
+  b_lr_ratio: 4.0
+
+loss:
+  name: balanced_huber
+  args:
+    bins_mm_h: [2.0, 5.0, 10.0, 30.0]
+    weights: [1.0, 1.0, 2.0, 5.0, 10.0]
+huber_delta: 0.01
+rel_eps: 0.01
+
+functional_distill:
+  weight: 0.05
+  sample_q: 128
+  loss: mse
+  cell_mode: both
+  grid_scale: 2
+
+# CoordConv/Fourier-feature residual.  0.20 normalized is at most 14.98 mm/h;
+# it only applies near ASOS stations, and its grid effect is additionally
+# penalized by functional_distill.
+global_residual:
+  enabled: true
+  station_csv: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_train.csv
+  station_meta: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_train.json
+  fourier_bands: [1, 2, 4, 8]
+  hidden_dim: 32
+  max_delta_norm: 0.20
+  gate_radius_norm: 0.15
+  lr: 0.001
+
+val_seed: 0
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.002
+
+epoch_max: 200
+epoch_val: 1
+epoch_save: 5
+early_stopping:
+  patience: 25
+  min_delta: 0.0

@@ -1,0 +1,105 @@
+# =====================================================================
+# LTE finetune with Weighted-MAE loss  (Wang, Tian & Carroll, 2023, Eq. 1)
+#   - correction layer(add_layer / adapter) 미사용
+#   - GT : ASOS 관측소 (obs_state: true)  -> pad_collate + mask
+#   - 사전학습 체크포인트: _climate_edsr_topo_80x100_topo_minmax_lte 의 마지막 에폭
+#   실행:
+#     python train_liif_finetune_weighted_mae.py \
+#       --config configs/train_climate/climate_edsr_topo_80x100_topo_minmax_lte_ft_weighted_mae.yaml \
+#       --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_1998_2009_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_1998_2009_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      # ASOS 일강수 (전체 4380, 필터 없음). ObsInMemory 가 meta 의 min_val/max_val(0~506.02)로 minmax 정규화.
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_1998_2009_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true      # ASOS 관측소 값이 GT. 날짜마다 지점 수가 달라 pad_collate 로 padding+mask.
+      sample_q: 1024        # obs_state=true 면 그리드 샘플이 관측소로 대체되어 사실상 미사용
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_2020_2022_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_2020_2022_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/preprocessing_codes/preprocessed_obs_daily_precip_2020_2022_utc_4380.csv
+      meta_path: /home/inhye_yoo/deeplearning/inr/liif/load/climate/meta/train_imerg80x100_meta.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+
+# pred/gt([0,1]) <-> mm/day 변환. eval_psnr(PSNR) 계산과 loss_space=physical 에 사용.
+# meta 의 min_val/max_val 과 동일 => obs GT 도 이 값으로 denorm 가능.
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 506.01995849609375
+
+# 이어서 학습할 사전학습 체크포인트 (마지막 에폭)
+finetune_from: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_topo_80x100_topo_minmax_lte/epoch-last.pth
+
+# ---- Wang et al. (2023) Section 3.1.3, Eq. (1) : Weighted MAE ----------
+loss:
+  name: weighted_mae
+  args:
+    # w1 = clip(y_true, MIN, MAX). loss_space=physical 이므로 단위는 mm/day.
+    w_min: 0.1          # MIN : 무강수/약한 비에도 남길 최소 가중치 (mm/day)
+    w_max: 50.0         # MAX : 호우 상한 가중치. 학습 ASOS 강수의 ~99퍼센타일로 맞추는 것을 권장 (mm/day)
+    normalize_by_weight: false   # false = 논문 그대로 (1/n)*sum(w*|e|)   (n = mask=1 인 실제 지점 수)
+loss_space: physical   # 'physical'(mm/day, 논문과 동일 단위) | 'normalized'([0,1])
+
+# ---- 모델 (참고용; 실제 구조/가중치는 finetune_from 체크포인트에서 로드) -----
+#   layer_spec 없음 => correction_layer 는 항등 함수. add_layer 부착 시 스크립트가 에러.
+model:
+  name: lte
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    extra_in_dim: 1
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.00001        # head 만 학습(freeze_encoder=true). 느리면 5e-5 / 1e-4 로 상향 검토.
+
+# multi_step_lr:
+#   milestones: [15, 25]
+#   gamma: 0.5
+
+freeze_encoder: true    # EDSR encoder 동결, LTE head(coef/freq/phase/imnet)만 학습
+reset_optimizer: true   # 새 optimizer 로 시작 (파인튜닝)
+reset_epoch: true       # epoch 번호를 1부터
+
+epoch_max: 30
+epoch_val: 1
+epoch_save: 1

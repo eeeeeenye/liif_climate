@@ -5,9 +5,6 @@
           dataset: $spec; wrapper: $spec; batch_size:
         val_dataset:
           dataset: $spec; wrapper: $spec; batch_size:
-        (data_norm):
-            inp: {sub: []; div: []}
-            gt: {sub: []; div: []}
         (eval_type):
         (eval_bsize):
 
@@ -61,6 +58,9 @@ def pad_collate(batch):
     padded_coord=[]                                         # coord는 station/query point 길이가 다를 수 있으므로 padding 후 저장
     padded_cell = []                                        # cell은 coord와 같은 point 단위 정보이므로 padding 후 저장
     padded_level=[]                                         # level은 샘플별 고도/레벨 정보로, 기존 shape를 유지해 stack하기 위해 저장
+    has_global_coord = 'global_coord' in batch[0]            # 선택적 절대 위치 residual adapter 입력
+    padded_global_coord = []
+    global_bboxes = []
     masks = []                                              # 실제 데이터와 padding 데이터를 구분하는 mask를 저장
 
     # 길이만큼 반복 처리
@@ -74,8 +74,11 @@ def pad_collate(batch):
         coord = b['coord']      # dim : [station, 1]  
         # 각 좌표가 대표하는 cell 크기 또는 해상도 정보                                       
         cell = b['cell']        # dim : [station,2]
-        # 고도/level 등 추가 입력 정보                               
-        level = b['level']      # dim : [1, 100, 100]                             
+        if has_global_coord:
+            global_coord = b['global_coord']
+            global_bbox = b['global_bbox']
+        # 고도/level 등 추가 입력 정보 (topo_nc_path 없는 config면 None)
+        level = b['level']      # dim : [1, 100, 100] 또는 None
         # 패드 길이
         pad_len = max_len-q                                 # 현재 샘플 길이 q를 배치 최대 길이 max_len에 맞추기 위해 추가해야 하는 길이
 
@@ -86,10 +89,11 @@ def pad_collate(batch):
         gt_padded = F.pad(gt, (0, 0, 0, pad_len))
         # cell의 첫 번째 차원(point 개수)을 max_len까지 0으로 padding / dim : [max_len,2]              
         cell_padded = F.pad(cell, (0, 0, 0, pad_len))        
+        if has_global_coord:
+            global_coord_padded = F.pad(global_coord, (0, 0, 0, pad_len))
 
         # 배열 길이만큼의 mask 배열 생성
         mask = torch.zeros(max_len, dtype=torch.float32)     # padding을 포함한 max_len 길이의 mask를 0으로 초기화
-        print('mask shape : ', mask.shape)
         # 실제 데이터가 있는 위치를 1.0으로 할당
         # 1: 실제 스테이션 데이터, 0: 패딩으로 추가한 가짜 데이터
         mask[:q] = 1.0                                      # dim : [max_len]  
@@ -100,19 +104,26 @@ def pad_collate(batch):
         padded_gt.append(gt_padded)                         # padding된 gt를 리스트에 추가
         padded_coord.append(coord_padded)                   # padding된 coord를 리스트에 추가
         padded_cell.append(cell_padded)                     # padding된 cell을 리스트에 추가
+        if has_global_coord:
+            padded_global_coord.append(global_coord_padded)
+            global_bboxes.append(global_bbox)
         padded_level.append(level)                          # level 정보를 리스트에 추가
         masks.append(mask)                                  # 현재 샘플의 mask를 리스트에 추가
-        print(f'inp : torch.stack(padded_inp, dim=0) {torch.stack(padded_gt, dim=0).shape}')
-    
+
     # 마스크와 패딩을 각각 만들어 저장
     batch_out = {                                           # DataLoader가 최종적으로 반환할 batch dictionary 생성
             'inp' : torch.stack(padded_inp, dim=0),          # 샘플별 inp를 batch 차원(dim=0)으로 쌓아 [B, ...] 형태로 만듦 dim : [16(batch), 1(ch), 50(H), 50(W)]
             'gt' : torch.stack(padded_gt, dim=0),            # padding된 gt를 [B, max_len, 1(channel)] 형태로 쌓음
             'coord': torch.stack(padded_coord, dim=0),       # padding된 coord를 [B, max_len, 2(x, y)] 형태로 쌓음
-            'cell': torch.stack(padded_cell, dim=0),         # padding된 cell을 [B, max_len, 2(x, y)] 형태로 쌓음 
-            'level': torch.stack(padded_level, dim=0),       # level을 batch 차원으로 쌓음 [B, 1, 100, 100]
+            'cell': torch.stack(padded_cell, dim=0),         # padding된 cell을 [B, max_len, 2(x, y)] 형태로 쌓음
+            # topo_nc_path 없는 config(model B radar_hsr_2x 등)면 모든 샘플의 level이 None
+            # -> stack하지 않고 None 그대로 둠 (model.forward(inp, topo=None, ...)와 동일 규약)
+            'level': torch.stack(padded_level, dim=0) if padded_level[0] is not None else None,
             'mask': torch.stack(masks, dim=0),               # mask를 [B, max_len] 형태로 쌓음
         }
+    if has_global_coord:
+        batch_out['global_coord'] = torch.stack(padded_global_coord, dim=0)
+        batch_out['global_bbox'] = torch.stack(global_bboxes, dim=0)
 
     return batch_out                                        # padding과 mask 처리가 완료된 batch를 반환
 
@@ -134,7 +145,11 @@ def make_data_loader(spec, tag=''):
     # 데이터셋 사이즈를 프롬프트상에 보여줌
     log('{} dataset: size={}'.format(tag, len(dataset)))     # train/val dataset의 전체 샘플 개수를 log에 출력
     for k, v in dataset[0].items():                          # 첫 번째 샘플의 key와 tensor 값을 확인하면서
-        log('  {}: shape={}'.format(k, tuple(v.shape)))      # 각 항목(inp, gt, coord 등)의 shape를 log에 출력
+        # topo_nc_path 없는 config면 level이 None이라 .shape가 없음
+        if torch.is_tensor(v):
+            log('  {}: shape={}'.format(k, tuple(v.shape)))  # 각 항목(inp, gt, coord 등)의 shape를 log에 출력
+        else:
+            log('  {}: {}'.format(k, v))
 
     # PyTorch DataLoader 객체 생성
     loader = DataLoader(                                     
@@ -178,6 +193,13 @@ def prepare_training():
         for p in model.imnet.parameters():                        # 모델의 implicit decoder/imnet 부분 파라미터를 하나씩 순회
             p.requires_grad = False                               # imnet도 pretrained 값을 유지하도록 학습에서 제외
 
+        # LTE 는 encoder/imnet 외에 coef/freq/phase(진폭/주파수/위상) conv/linear 를 따로 갖고 있어
+        # 위 두 loop만으로는 안 잡힘 -> 있으면 같이 freeze (LIIF 는 이 속성이 없어 hasattr 로 안전하게 스킵).
+        for name in ('coef', 'freq', 'phase'):
+            if hasattr(model, name):
+                for p in getattr(model, name).parameters():
+                    p.requires_grad = False
+
         if model.add_layer is not None:                           # 보정층/additional layer가 모델에 존재하는 경우
             for p in model.add_layer.parameters():                 # add_layer의 파라미터를 하나씩 순회
                 p.requires_grad = True                            # add_layer만 학습되도록 gradient 계산을 활성화
@@ -188,21 +210,23 @@ def prepare_training():
             config['optimizer']                                   # optimizer 종류, learning rate 등 config 설정 사용
         )
 
-        # # 학습시작 전 파라미터 직접 확인
-        # print("=" * 50)                                          # 출력 구분선
-        # print("Trainable parameters:")                           # trainable/frozen parameter 목록 출력 시작 표시
-        # for name, p in model.named_parameters():                   # 모델의 모든 파라미터 이름과 tensor를 순회하며 학습 여부 확인
-        #     if p.requires_grad:                                   # gradient 계산이 켜진 파라미터라면
-        #         print(f" [TRAIN] {name}")                         # 학습되는 파라미터로 출력
-        #     else:                                                 # gradient 계산이 꺼진 파라미터라면
-        #         print(f" [FROZEN] {name}")                        # freeze된 파라미터로 출력
-        # print("=" * 50)                                          # 출력 구분선
+        # 학습시작 전 파라미터 직접 확인 (freeze/adapter가 의도대로 됐는지 log에 남김)
+        log("=" * 50)                                              # 출력 구분선
+        log("Trainable parameters:")                               # trainable/frozen parameter 목록 출력 시작 표시
+        for name, p in model.named_parameters():                   # 모델의 모든 파라미터 이름과 tensor를 순회하며 학습 여부 확인
+            if p.requires_grad:                                   # gradient 계산이 켜진 파라미터라면
+                log(f" [TRAIN] {name}")                            # 학습되는 파라미터로 출력
+            else:                                                 # gradient 계산이 꺼진 파라미터라면
+                log(f" [FROZEN] {name}")                           # freeze된 파라미터로 출력
+        log("=" * 50)                                              # 출력 구분선
 
         # total parameter를 확인하고 학습할 수 있는 파라미터만 확인
         # 최종적으로 total에서 학습가능하지 않은 파라미터 빼고 확인
         total = sum(p.numel() for p in model.parameters())         # 모델 전체 파라미터 개수 계산
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)  # 실제 학습되는 파라미터 개수 계산
-        # frozen = total - trainable                                 # 전체 파라미터에서 학습되는 파라미터를 빼 freeze된 개수 계산
+        frozen = total - trainable                                 # 전체 파라미터에서 학습되는 파라미터를 빼 freeze된 개수 계산
+        log(f"frozen param : {frozen}")
+        log(f"trainable param : {trainable}")
 
         # epoch을 저장된 파일에서 마지막으로 저장된 epoch 다음부터 시작
         epoch_start = sv_file['epoch'] + 1                         # checkpoint가 저장된 epoch 다음 epoch부터 학습 재개
@@ -233,16 +257,9 @@ def prepare_training():
 
 def train(train_loader, model, optimizer):
     model.train()                                                   # 모델을 train mode로 전환하여 dropout/batchnorm 등이 학습 방식으로 동작하게 함
-    loss_fn = nn.L1Loss(reduction='none')                           # 각 위치별 L1 loss를 따로 얻기 위해 reduction 없이 loss function 선언
+    # config 의 loss: 'mse'(기본, 기존 동작) | 'l1'.  각 위치별 loss 를 따로 얻기 위해 reduction 없이 선언 (padding mask 적용용)
+    loss_fn = nn.L1Loss(reduction='none') if config.get('loss', 'mse') == 'l1' else nn.MSELoss(reduction='none')
     train_loss = utils.Averager()                                   # 학습과정에서 각 batch의 loss를 누적하여 평균을 계산하는 객체
-
-    data_norm = config['data_norm']                                 # 정규화에 사용할 sub/div 값을 config에서 가져오기
-    t = data_norm['inp']                                            # input 데이터 정규화에 사용할 sub/div 설정 가져오기
-    inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()  # input에서 뺄 평균/기준값을 channel 차원에 맞춰 [1,C,1,1] 형태로 변환 후 GPU로 이동
-    inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()  # input을 나눌 표준편차/스케일값을 [1,C,1,1] 형태로 변환 후 GPU로 이동
-    t = data_norm['gt']                                             # GT 정규화에 사용할 sub/div 설정 가져오기
-    gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()      # GT에서 뺄 값이 target dimension에 broadcast되도록 [1,1,D] 형태로 변환
-    gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()      # GT를 나눌 값이 target dimension에 broadcast되도록 [1,1,D] 형태로 변환
 
     # train 데이터 배치별로 가져오기
     for batch in tqdm(train_loader, leave=False, desc='train'):      # train_loader에서 batch를 하나씩 가져오며 진행률 표시
@@ -252,14 +269,15 @@ def train(train_loader, model, optimizer):
 
         # key, value 가져오기
         for k, v in batch.items():                                  # batch dictionary의 모든 tensor 항목을 순회
-            batch[k] = v.cuda()                                     # 각 tensor를 GPU로 이동
+            # topo_nc_path 없는 config면 level이 None이라 .cuda()가 없음 (test.py와 동일 규약)
+            if torch.is_tensor(v):
+                batch[k] = v.cuda()                                 # 각 tensor를 GPU로 이동
 
-        # input 데이터 정규화 (config의 sub/div 기준으로 스케일 조정)
-        inp = (batch['inp'] - inp_sub) / inp_div                    # input을 모델이 학습한 scale에 맞게 정규화
+        inp = batch['inp']
 
         # 모델에 train 데이터, 고도, 좌표, cell을 input
         pred = model(inp, batch['level'], batch['coord'], batch['cell'])  # 입력 격자, level, 좌표, cell 정보를 이용해 각 point의 예측값 계산
-        gt = (batch['gt'] - gt_sub) / gt_div                        # 정답 gt도 pred와 같은 scale에서 비교하기 위해 정규화
+        gt = batch['gt']
 
         # loss 적용
         loss = loss_fn(pred, gt)                                    # pred와 gt 사이의 point별/변수별 L1 loss 계산
@@ -292,13 +310,6 @@ def main(config_, save_path):
 
     # train_loader와 val_loader 객체 생성
     train_loader, val_loader = make_data_loaders()                  # config를 기반으로 train/validation DataLoader 생성
-
-    # data norm을 지정하지 않았다면 0, 1로 설정
-    if config.get('data_norm') is None:                             # config에 data_norm 항목이 없으면
-        config['data_norm'] = {                                     # 정규화를 하지 않는 것과 같은 기본값 설정
-            'inp': {'sub': [0], 'div': [1]},                        # input은 0을 빼고 1로 나누도록 설정
-            'gt': {'sub': [0], 'div': [1]}                          # gt도 0을 빼고 1로 나누도록 설정
-        }
 
     # prepare_training에서 모델과 옵티마이저, 에폭 시작 시점, 스케줄러 생성
     model, optimizer, epoch_start, lr_scheduler = prepare_training() # 학습에 필요한 모델/optimizer/scheduler와 시작 epoch 준비
@@ -367,9 +378,10 @@ def main(config_, save_path):
             else:                                                   # 그 외 경우에는
                 model_ = model                                      # 현재 model 객체를 평가에 사용
             val_res, val_loss = eval_psnr(val_loader, model_,       # validation loader와 모델로 PSNR 및 validation loss 계산
-                data_norm=config['data_norm'],                      # 평가 시에도 train과 같은 정규화 설정 사용
+                physical_norm=config['physical_norm'],               # mm/day 물리량 환산을 위한 정규화 정보 전달
                 eval_type=config.get('eval_type'),                  # config에 평가 방식이 있으면 전달
-                eval_bsize=config.get('eval_bsize'))                # 평가 batch size가 따로 있으면 전달
+                eval_bsize=config.get('eval_bsize'),                # 평가 batch size가 따로 있으면 전달
+                loss_type=config.get('loss', 'mse'))                # val loss 도 train 과 같은 종류로 (mse 기본)
 
             # 학습 정보 log로 보여줌 (프롬프트에)
             log_info.append('val: psnr={:.4f}'.format(val_res))     # validation PSNR을 log 문자열에 추가

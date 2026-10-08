@@ -3,7 +3,7 @@ train_dataset:
     name: image-folder
     args:
       root_path: ./load/gpp/gpp_001deg_output
-      topo_nc_path: /home/share/KCP/2026/INR/_nc/elev_SRTM_v11_001deg.nc
+      # topo_nc_path: /home/share/KCP/2026/INR/_nc/elev_SRTM_v11_001deg.nc
       repeat: 20
       cache: in_memory
   wrapper:
@@ -20,7 +20,7 @@ val_dataset:
     name: image-folder
     args:
       root_path: ./load/gpp/gpp_001deg_output_val
-      topo_nc_path: /home/share/KCP/2026/INR/_nc/elev_SRTM_v11_001deg.nc
+      # topo_nc_path: /home/share/KCP/2026/INR/_nc/elev_SRTM_v11_001deg.nc
       first_k: 10
       repeat: 160
       cache: in_memory
@@ -48,7 +48,7 @@ model:
       args:
         out_dim: 1
         hidden_list: [256, 256, 256, 256]
-    extra_in_dim: 1
+    # extra_in_dim: 1
 
 optimizer:
   name: adam

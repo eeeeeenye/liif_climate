@@ -64,7 +64,7 @@ def make(dataset_spec, args=None):
 
     # registry에서 클래스 찾아 생성
     #
-    # 예:
+    # 예시로
     # datasets['image-folder']
     # -> ImageFolder 클래스
     #

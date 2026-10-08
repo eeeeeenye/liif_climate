@@ -1,0 +1,66 @@
+# IMERG(0.1deg, 입력) -> HSR(~500m, 정답) 일누적 강수 다운스케일링, LTE.
+# 데이터: imerg2hsr/build_daily_pairs.py 산출물 (train=2019-2020 JJA, val=2021 JJA, 273일 중 273일 사용)
+# LR/HR은 서로 다른 센서(위성/레이더)지만 같은 물리량(mm/day)이라 IMERG self-SR 관례와 동일하게
+# 하나의 공유 max(gmax=1301.1564, train만으로 계산)로 정규화되어 있음 (norm_meta.json 참고).
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/LR_train_norm.nc
+      root_path_2: /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/HR_train_norm.nc
+      var_name: precipitation
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 32   # LR(100x80)에서 32x32 랜덤 crop -> HR은 비율로 환산해 대응 영역 crop
+      obs_state: false
+      sample_q: 1024
+      augment: true
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/LR_val_norm.nc
+      root_path_2: /home/inhye_yoo/deeplearning/inr/liif/imerg2hsr/data/HR_val_norm.nc
+      var_name: precipitation
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      inp_size: 32
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 1301.1563720703125
+model:
+  name: lte
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    # extra_in_dim 없음: topo 미사용 (baseline). 필요하면 topo_nc_path/extra_in_dim 추가.
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+multi_step_lr:
+  milestones: [40, 70, 90]
+  gamma: 0.5
+epoch_max: 100
+# resume 없음: LTE는 liif 체크포인트와 파라미터 구조가 달라 from scratch 로만 시작 가능
+epoch_val: 1
+epoch_save: 5

@@ -1,0 +1,127 @@
+# =====================================================================
+# HSR 시간별 MLP adapter 를 Bernoulli-Gamma(Cannon 2008) NLPD 로 파인튜닝.
+#   ft_mlp_1e-3_lag1h 와 동일: encoder/imnet 동결, MLP adapter([32,16,32])만 학습, lag1h 정렬 obs.
+#   차이: (1) adapter 출력 1 -> 3 (p, alpha, beta)  (2) 손실 MSE -> NLPD
+#         (3) obs CSV 는 --fill zero 버전(건조 시각 = 0.0): p 항 학습에 건조 표본이 필수.
+#   실행:
+#     python train_liif_finetune_bg.py --config configs/train_climate/<이 파일> --gpu 2
+# =====================================================================
+
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      # train을 2019-2020 -> 2019 JJA만으로 좁히고(cdo selyear,2019),
+      # ASOS 관측소 bbox+패딩(lon 124.2-131.4, lat 32.7-38.8)으로 한 번 더 crop
+      # (cdo sellonlatbox) -> 면적 약 25%로 줄어서 feat_unfold 메모리도 그만큼 절감.
+      # obs meta도 이 crop된 도메인 기준으로 새로 생성해서 좌표 정규화가 어긋나지 않음
+      # (전체 도메인 기준 좌표를 그대로 쓰면 grid_sample이 엉뚱한 위치를 가리키는
+      # 버그가 남 - latlon flip 버그와 같은 종류라 반드시 meta도 같이 crop 버전으로 교체).
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/HSR_2019JJA_500m_norm_obscrop.nc
+      var_name: precip_norm
+      # 시스템 RAM 503GB 중 440GB 여유 확인 -> crop 후 파일이 더 작아져서(14.4GB+3.6GB) 더 여유있게 로드 가능.
+      load_into_memory: true
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_fillzero_train.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_fillzero_train.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true      # ASOS 관측소 값이 GT. 날짜(시간)마다 지점 수가 달라 pad_collate 로 padding+mask.
+      sample_q: 1024        # obs_state=true 면 그리드 샘플이 관측소로 대체되어 사실상 미사용
+      augment: false
+      # pretrain은 inp_size=48 랜덤crop이라 feat_unfold가 48x48에서만 돌았는데, obs_state
+      # finetune은 원래 crop 없이 전체 이미지(지금은 663x617)를 매번 통째로 인코더에
+      # 태워서 그만큼 느렸음. inp_size를 다시 켜되, wrappers_ft.py를 고쳐서 관측소 중
+      # 하나를 anchor로 삼아 그 지점이 반드시 window 안에 들어오게 crop하고 좌표도
+      # window 기준으로 재정규화하도록 함 (그냥 랜덤 crop하면 관측소가 없는 빈 배치만
+      # 나올 확률이 높아서 이렇게 함).
+      # 48이었을 때 관측소 밀도상 window당 평균 <1개만 잡혀서(실측 30/30 trial 전부 1개)
+      # adapter가 신호 부족으로 거의 상수로 collapse함.
+      # inp_size를 192로 키워봤더니(면적 16배) epoch이 8.5분(300epoch=42시간)으로
+      # 너무 느려짐 - feat_unfold 비용이 면적에 비례해서 그대로 16배 걸림.
+      # 대신 patch는 48로 되돌리고 batch_size를 늘리는 게 훨씬 쌈: feat_unfold 비용은
+      # batch에는 "선형"으로만 붙어서, batch=64면 스텝당 평균 관측소 수(64*0.76≈49개)가
+      # inp_size=192(스텝당 8*4.2≈34개)보다 많으면서도 계산량은 훨씬 적음.
+      inp_size: 48
+  # patch crop(48x48) + batch_size를 키워서 스텝당 관측소 수 확보 -> pretrain급 속도 유지.
+  # sustained 학습에서 caching allocator 파편화가 있었으니 실행 시 여전히
+  #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 를 같이 쓸 것.
+  batch_size: 64
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_norm_2x_obscrop.nc
+      root_path_2: /home/inhye_yoo/data/radar_HSR/hsr_hourly_precip_nc/merge/regrid/HSR_val_500m_norm_obscrop.nc
+      var_name: precip_norm
+      load_into_memory: true   # train과 동일한 이유
+      obs_path_3: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/obs_hourly_HSR_500m_2019JJA_obscrop_lag1h_fillzero_val.csv
+      meta_path: /home/inhye_yoo/data/observation/raw/ASOS/hourly/hsr_obs/meta_HSR_500m_2019JJA_obscrop_lag1h_fillzero_val.json
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: true
+      sample_q: 1024
+      augment: false
+      inp_size: 48   # train과 동일한 이유
+  batch_size: 32
+
+# pred/gt([0,1]) <-> mm/hour 변환. eval_psnr(PSNR) 계산에 사용.
+# meta 의 min_val/max_val 과 동일 => obs GT 도 이 값으로 denorm 가능.
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 74.8784
+
+# 이어서 학습할 사전학습 체크포인트 (마지막 에폭)
+resume: /home/inhye_yoo/deeplearning/inr/liif/save/_climate_edsr_radar_hsr_2x_minmax_liif/epoch-last.pth
+
+# ---- 모델 (참고용; 실제 encoder/imnet 구조/가중치는 resume 체크포인트에서 로드) -----
+#   encoder/imnet은 train_liif_finetune.py의 prepare_training()이 자동으로 freeze.
+#   add_layer(아래 layer_spec)만 학습됨.
+model:
+  name: liif
+  args:
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    layer_spec:
+      name: bg-adapter
+      args:
+        out_dim: 3          # (p, alpha, beta)
+        in_scale: 74.8784   # physical_norm.max 와 동일
+        in_transform: log1p
+        init_p: 0.1         # 기후학적 강수확률 근처에서 출발 (fillzero train 9%)
+        init_alpha: 1.0
+        init_beta: 1.0
+        hidden_dims:
+        - 32
+        - 16
+        - 32
+    # extra_in_dim 없음: topo_nc_path 미사용(model B는 topo 채널 없이 pretrain됨)
+
+optimizer:
+  name: adam
+  args:
+    lr: 0.001   # 기존 MLP adapter(1e-3)와 동일. NLL 이 불안정하면 1e-4 로.
+
+# train_liif_finetune_bg.py 는 checkpoint 의 epoch 를 이어받지 않고 1부터 시작 -> epoch_max = 실제 epoch 수.
+epoch_max: 100
+epoch_val: 1
+epoch_save: 1
+
+bg:
+  wet_thr: 0.05   # y(mm/h) >= 0.05 이면 wet (ASOS 0.1mm 단위 -> 0.1 이상이 wet)
+  y_floor: 0.05   # log(y) 바닥
+  p_thr: 0.5      # POD/FAR/CSI/TSS 계산용 강수 판정 임계 (p > p_thr)

@@ -1,0 +1,67 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args: 
+      root_path_1: ./load/gpp/gpp_01deg_input_x5
+      root_path_2: ./load/gpp/gpp_001deg_output
+      topo_nc_path: /home/share/KCP/2026/INR/_nc/elev_SRTM_v11_001deg.nc
+      cache: in_memory
+  wrapper:
+    name: sr-implicit-paired
+    args:
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: ./load/gpp/gpp_01deg_input_val_x5
+      root_path_2: ./load/gpp/gpp_001deg_output_val
+      topo_nc_path: /home/share/KCP/2026/INR/_nc/elev_SRTM_v11_001deg.nc
+      cache: in_memory
+  wrapper: 
+    name: sr-implicit-paired
+    args: 
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+
+data_norm:
+  inp: {sub: [0.5], div: [0.5]}
+  gt: {sub: [0.5], div: [0.5]}
+
+# train_liif.py 의 eval_psnr 가 config['physical_norm'] 를 필수로 참조함.
+# PNG(8bit)는 이미 [0,1]로 읽히므로 우선 minmax 0~1 로 두고,
+# GPP 물리값(원 스케일) PSNR 이 필요하면 실제 min/max 로 교체할 것.
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 1.0
+
+model:
+  name: lte
+  args:
+    hidden_dim: 256          # coef/freq Conv2d 출력 채널, imnet in_dim = hidden_dim + extra_in_dim
+    encoder_spec:
+      name: edsr
+      args:
+        no_upsampling: true
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list: [256, 256, 256, 256]
+    extra_in_dim: 1          # topo(elevation) 채널 수 -> topo_nc_path 있으므로 항상 공급됨
+
+optimizer:
+  name: adam
+  args: 
+    lr: 1.e-4
+epoch_max: 20
+multi_step_lr: 
+  milestones: [200, 400, 600, 800]
+  gamma: 0.5
+epoch_val: 1
+epoch_save: 100

@@ -1,0 +1,70 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_1998_2009_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_1998_2009_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_02deg_2020_2022_minmax.nc
+      root_path_2: /home/inhye_yoo/data/IMERG/Imerg_raw/kor_data/minmax_norm/imerg_precip_korea_daily_01deg_2020_2022_minmax.nc
+      topo_nc_path: /home/inhye_yoo/data/level/NOAA_ETOPO1_topo/ETOPO1_Ice_g_gmt4_kor.nc
+      topo_kwargs:
+        normalize: standard_tanh
+  wrapper:
+    name: sr-implicit-paired-ft
+    args:
+      obs_state: false
+      sample_q: 1024
+      augment: false
+  batch_size: 16
+physical_norm:
+  type: minmax
+  min: 0.0
+  max: 506.01995849609375
+model:
+  name: lte
+  args:
+    encoder_spec:
+      name: swinir
+      args:
+        no_upsampling: true      # upsampler='none' -> (B, 64, H, W) feature, out_dim=64
+        in_chans: 1
+        window_size: 8
+        # 기본값(=classical SwinIR): embed_dim 180, depths/num_heads [6,6,6,6,6,6]
+        # 가볍게 테스트하려면 아래 주석 해제
+        # embed_dim: 60
+        # depths: [6, 6, 6, 6]
+        # num_heads: [6, 6, 6, 6]
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list:
+        - 256
+        - 256
+        - 256
+        - 256
+    extra_in_dim: 1   # topo 채널 수: elevation
+optimizer:
+  name: adam
+  args:
+    lr: 0.0001
+multi_step_lr:
+  milestones: [200, 400, 600, 800]
+  gamma: 0.5
+epoch_max: 20     # 동작 확인용 짧은 런
+epoch_val: 1
+epoch_save: 1

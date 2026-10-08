@@ -1,0 +1,274 @@
+======================================================================
+ Weighted-MAE 파인튜닝 수정 내역 (correction layer 미사용)
+======================================================================
+작성일   : 2026-09-09
+개정      : 2026-09-09  obs_state: true (ASOS 관측소 GT) 지원 추가
+            -> pad_collate + mask 복원, train() 에서 mask=1 지점에만 손실 적용
+            -> config 를 obs_state: true / 전체 4380 CSV / freeze_encoder: true 로 갱신
+
+참고문헌
+--------
+Wang, F., Tian, D., & Carroll, M. (2023).
+Customized deep learning for precipitation bias correction and downscaling.
+Geoscientific Model Development, 16, 535-556.
+https://doi.org/10.5194/gmd-16-535-2023
+  -> Section 3.1.3 (Customized loss functions), Eq. (1) : Weighted MAE
+
+목표
+----
+사전학습된 LTE 체크포인트
+  save/_climate_edsr_topo_80x100_topo_minmax_lte/epoch-last.pth   (= epoch 20, 마지막 에폭)
+를 출발점으로, correction layer(adapter / add_layer)를 전혀 쓰지 않고
+손실만 Weighted MAE 로 바꾸어 이어서 파인튜닝한다.
+
+Weighted MAE 정의 (논문 Eq. 1)
+------------------------------
+  L_MAE_weighted = (1/n) * sum_i [ w1_i * | y_pred_i - y_true_i | ]
+
+  w1_i = clip(y_true_i, MIN, MAX)
+       = MIN         (y_true_i <= MIN)
+       = y_true_i     (MIN < y_true_i < MAX)
+       = MAX         (y_true_i >= MAX)
+
+즉 "정답 강수값 자체를 [MIN, MAX] 로 클리핑한 값"을 각 픽셀 오차의 가중치로 사용한다.
+강수량이 클수록 그 픽셀의 오차에 더 큰 페널티가 붙어, 호우(tail) 과소모의가 완화된다.
+논문에서 y_true, MIN, MAX 는 모두 물리 단위(mm/day) 이다.
+
+
+======================================================================
+ 1. 새로 만든 파일
+======================================================================
+
+(A) losses_wang2023.py                                          [신규]
+    - 이 논문의 "커스텀 손실" 계열을 모아두는 전용 모듈.
+    - weighted_mae(pred, target, w_min, w_max, normalize_by_weight=False)
+        : Eq.(1) 의 함수형 구현.
+        : w = clamp(target.detach(), w_min, w_max)
+        : normalize_by_weight=False -> (w*|e|).mean()          (논문 그대로 1/n)
+          normalize_by_weight=True  -> (w*|e|).sum() / w.sum() (가중평균, 스케일 완화용 옵션)
+    - class WeightedMAELoss(nn.Module)
+        : nn.L1Loss() 자리에 그대로 대체 가능한 형태.
+        : 인자 w_min, w_max, normalize_by_weight, clamp_pred(선택: pred 를 특정 범위로 clamp).
+        : w_max > w_min 을 assert 로 강제.
+    - make_loss(loss_spec)
+        : yaml 의 loss 블록( {name, args} ) -> loss 객체.
+        : 현재 등록된 이름: 'weighted_mae'.
+    - 이 모듈은 "단위(space) 에 무관" 하다. 넘겨받은 target 을 w_min/w_max 로 클리핑할 뿐이며,
+      물리단위(mm/day)로 쓸지 정규화([0,1])로 쓸지는 호출하는 학습 스크립트가 결정한다.
+
+(B) train_liif_finetune_weighted_mae.py                          [신규]
+    - train_liif_finetune.py 를 베이스로 한 파인튜닝 스크립트.
+    - 아래 2번 항목에 train_liif_finetune.py 대비 바뀐 부분을 상세히 정리.
+
+(C) configs/train_climate/climate_edsr_topo_80x100_topo_minmax_lte_ft_weighted_mae.yaml  [신규]
+    - (B) 스크립트용 config. 아래 3번 항목 참고.
+
+
+======================================================================
+ 2. train_liif_finetune_weighted_mae.py 가 train_liif_finetune.py 와
+    "다른 부분" (자세히)
+======================================================================
+
+── 2-1. 데이터 로더 : pad_collate 유지 (obs_state 양쪽 지원) ──────────
+  * wrapper(sr-implicit-paired-ft) 를 obs_state: true 로 쓰면 GT 가 ASOS 관측소 값이 되고,
+    날짜마다 유효 관측소 수가 달라 coord/gt/cell 길이가 샘플마다 다르다.
+    -> train_liif_finetune.py 의 pad_collate() 를 그대로 가져와서
+       배치 최대 길이로 0-padding + 실제 지점=1 인 'mask' 생성.
+  * obs_state: false (그리드에서 sample_q개 샘플) 로 써도 pad_collate 는 무해하다
+    (pad_len=0, mask 전부 1) -> 조건 분기 없이 항상 pad_collate 사용.
+  * pad_collate 는 {inp, gt, coord, cell, level, mask} 만 처리한다.
+    'is_obs' (그리드+관측 혼합 학습용 키) 는 이 스크립트에서 쓰지 않는다.
+    -> Weighted MAE 는 "관측소만" supervision (논문의 커스텀 손실을 그대로 적용).
+  * pad_collate 가 None 을 돌려주면(배치 내 유효 지점 0개) 해당 배치는 건너뛴다.
+
+── 2-2. prepare_training() : correction layer 로직 완전 제거 ─────────
+  train_liif_finetune.py 의 동작:
+    - config['resume'] 로드
+    - model.encoder / model.imnet 를 freeze
+    - model.add_layer(correction layer)만 requires_grad=True 로 학습
+  바뀐 동작:
+    - config['finetune_from'] 로 체크포인트 로드
+      (의미를 분명히 하려고 키 이름을 'resume' -> 'finetune_from' 으로 바꿈)
+    - 모델은 "체크포인트에 저장된 model spec 을 그대로" 써서 생성한다.
+        model_spec = sv_file['model']            # 구조 정보
+        model = models.make(model_spec, load_sd=True)
+      -> config 의 model 블록이 아니라 체크포인트 원본 구조를 사용하므로
+         레이어 이름/shape 불일치로 인한 부분 로드(strict=False) 문제가 원천 차단된다.
+         (config 의 model 블록은 가독성/참고용으로만 둠)
+    - correction layer 금지 가드 2중:
+        (1) model_spec['args'] 안에 'layer_spec' 이 있으면 RuntimeError.
+        (2) 생성된 model 에 add_layer 속성이 있으면 RuntimeError.
+      -> "correction layer 를 절대 쓰지 않는다" 를 코드로 보장.
+    - freeze 정책:
+        config.freeze_encoder: true (현재 config 기본) -> EDSR encoder 동결,
+        LTE head(coef/freq/phase/imnet, 약 1.44M 파라미터)만 학습.
+        ASOS 관측소는 하루 수십~수백 지점뿐이라 39.8M 전체를 풀면 과적합 위험이 커서
+        head 만 파인튜닝하는 편이 안전하다.
+        false 로 주면 encoder 포함 전체(38.4M frozen 해제) 파인튜닝.
+        (train_liif_finetune.py 처럼 encoder+imnet 을 통째로 얼리는 모드는 없음.
+         correction layer 가 없으니 다 얼리면 학습할 게 없기 때문.)
+    - optimizer:
+        config.reset_optimizer (기본 true) -> config['optimizer'] 로 새로 생성.
+        false 로 주면 체크포인트의 optimizer 상태(load_sd=True)를 복원.
+        optimizer 에는 requires_grad=True 인 파라미터만 넘긴다.
+    - epoch 번호:
+        config.reset_epoch (기본 true) -> epoch_start = 1 (새 학습으로 취급).
+        false 면 체크포인트 epoch+1 부터 번호를 이어감.
+    - lr_scheduler:
+        multi_step_lr 있으면 MultiStepLR 생성 후 epoch_start-1 만큼 미리 step
+        (train_liif_finetune.py 와 동일 로직).
+    - base_model_spec (sd 를 뺀 구조 dict) 를 전역에 저장해 두었다가
+      매 에폭 체크포인트 저장 시 재사용한다 (저장 포맷을 원본과 동일하게 유지).
+
+── 2-3. train() : 손실을 Weighted MAE 로 교체 + mask + 물리단위 변환 ──
+  train_liif_finetune.py:
+        loss_fn = nn.MSELoss(reduction='none')
+        loss = loss_fn(pred, gt)                 # 정규화 공간
+        loss = (loss*mask).sum() / mask.sum()    # 마스크 평균
+  바뀐 동작:
+        loss_fn = losses_wang2023.make_loss(config['loss'])   # WeightedMAELoss
+        pred = model(inp, level, coord, cell)
+        gt   = batch['gt']
+        valid = batch['mask'].bool()             # padding 된 가짜 지점 제외
+        pred, gt = pred[valid], gt[valid]        # -> (n_valid, 1)
+        if loss_space == 'physical':
+            pred_l = pred * scale + shift        # [0,1] -> mm/day
+            gt_l   = gt   * scale + shift
+        else:  # 'normalized'
+            pred_l, gt_l = pred, gt
+        loss = loss_fn(pred_l, gt_l)             # Weighted MAE, mm 공간
+    * boolean 인덱싱으로 유효 지점만 뽑은 뒤 WeightedMAE(elementwise -> .mean()) 를 부르면
+      결과가 정확히 (1/n_valid) * sum(w * |e|)  -> 논문 Eq.(1) 과 동일.
+    * (scale, shift) 는 physical_norm 에서 계산 (minmax: scale=max-min, shift=min).
+    * loss_space='physical' 이 기본. 이때 config.loss.args.w_min/w_max 는 mm/day 로 해석된다
+      (논문과 동일 단위).
+      -> ASOS GT 는 ObsInMemory 가 meta(train_imerg80x100_meta.json)의
+         min_val/max_val = 0 ~ 506.02 로 minmax 정규화하므로, physical_norm 과 동일한
+         (×506.02) denorm 으로 mm/day 복원이 맞다.
+    * loss_space='normalized' 로 두면 [0,1] 공간에서 그대로 계산하며,
+      이때 w_min/w_max 도 [0,1] 스케일로 줘야 한다 (예: 0.1mm -> 0.1/506 ≈ 0.0002).
+    * 관측 결측(-2.0)은 wrapper(sr-implicit-paired-ft) 에서 이미 제거된 뒤 들어온다.
+    * 유효 지점이 배치 전체에서 0개면 그 배치는 건너뛴다.
+
+── 2-4. main() : validation / 저장 로직 ──────────────────────────────
+  * validation 은 기존과 동일하게 test.eval_psnr(val_loader, model_,
+    physical_norm=config['physical_norm'], ...) 를 사용한다.
+    - test.py 의 eval_psnr 기본 loss_type 은 'mse' (2026-09-09 L1->MSE 전역 변경) 이지만,
+      이 스크립트는 eval_psnr(..., loss_type='l1') 로 호출해 val_loss 를 "정규화 공간 L1(MAE)" 로 쓴다.
+      (train/val 모두 L1 계열 유지.) 단순 L1 이며 Weighted MAE 는 아님:
+      학습 손실(mm 공간 Weighted MAE)과 스케일/가중이 다르니 헷갈리지 말 것.
+      로그 표기: 'val loss(L1, norm)='.
+    - PSNR 은 mm 공간에서 계산된다(기존과 동일).
+  * 체크포인트 저장:
+    - 매 에폭 epoch-last.pth
+    - epoch_save 주기로 epoch-{N}.pth
+    - PSNR 최고 -> epoch-best-psnr.pth
+    - val L1(norm) 최저 -> epoch-best-loss.pth
+    - 저장 dict 구조는 원본과 동일: {'model': {구조 + sd}, 'optimizer': {...+sd}, 'epoch': N}
+      -> 기존 test.py / inference_tools 스크립트로 그대로 로드 가능.
+  * 재현성: train_liif.py 처럼 set_seed(42) 추가.
+  * config 를 save_path/config.yaml 로 덤프(기존과 동일).
+
+── 2-5. import 변경 ────────────────────────────────────────────────
+  + from losses_wang2023 import make_loss
+  - (nn.MSELoss / L1Loss 직접 사용 제거; nn 은 DataParallel 용으로만 남김)
+
+
+======================================================================
+ 3. config 파일
+======================================================================
+파일: configs/train_climate/climate_edsr_topo_80x100_topo_minmax_lte_ft_weighted_mae.yaml
+
+핵심 키:
+  finetune_from : .../save/_climate_edsr_topo_80x100_topo_minmax_lte/epoch-last.pth
+  train/val dataset:
+    - IMERG 0.2deg -> 0.1deg minmax nc (1998-2009 / 2020-2022)
+    - topo: ETOPO1_Ice_g_gmt4_kor.nc, normalize: standard_tanh  (체크포인트 원 config 와 동일)
+    - obs_path_3 (ASOS 일강수, 전체 4380, 필터 없음):
+        train: preprocessed_obs_daily_precip_1998_2009_utc_4380.csv
+        val  : preprocessed_obs_daily_precip_2020_2022_utc_4380.csv
+    - meta_path: load/climate/meta/train_imerg80x100_meta.json  (min_val 0 / max_val 506.02 / 100x80)
+    - wrapper: sr-implicit-paired-ft, obs_state: true
+  physical_norm : {type: minmax, min: 0.0, max: 506.01995849609375}
+                  (체크포인트 원 config 및 obs meta 와 동일. -> obs GT 도 ×506.02 로 mm 복원)
+  loss:
+    name: weighted_mae
+    args:
+      w_min: 0.1        # Eq.(1) MIN  (mm/day)
+      w_max: 50.0       # Eq.(1) MAX  (mm/day)
+      normalize_by_weight: false     # 논문 그대로 (1/n), n = mask=1 인 실제 관측소 수
+  loss_space: physical  # mm/day 공간에서 손실 계산 (논문과 동일 단위)
+  optimizer: adam, lr 1e-5   # freeze_encoder=true 라 head 만 학습. 느리면 5e-5 / 1e-4 상향 검토.
+             (Adam 은 손실의 전역 스케일에는 둔감하므로 w 로 손실 절대값이 커져도
+              lr 을 그만큼 낮출 필요는 없다.)
+  multi_step_lr: (현재 yaml 에서 주석 처리 = 미사용, lr 1e-5 고정. 쓰려면 milestones [15, 25], gamma 0.5 주석 해제)
+  freeze_encoder: true       # EDSR encoder 동결, LTE head(coef/freq/phase/imnet ~1.44M)만 학습
+  reset_optimizer: true / reset_epoch: true
+  epoch_max: 30, epoch_val: 1, epoch_save: 1
+
+  * obs_state: false (IMERG 그리드 GT) 로 되돌리려면 wrapper.args.obs_state 만 false 로,
+    dataset.args 의 obs_path_3/meta_path 는 제거(또는 무시)하면 된다. 스크립트는 양쪽 모두 동작.
+
+
+======================================================================
+ 4. 실행 방법
+======================================================================
+cd /home/inhye_yoo/deeplearning/inr/liif
+conda activate liif   # (또는 ~/anaconda3/envs/liif/bin/python)
+
+python train_liif_finetune_weighted_mae.py \
+  --config configs/train_climate/climate_edsr_topo_80x100_topo_minmax_lte_ft_weighted_mae.yaml \
+  --gpu 2
+
+결과 저장 위치:
+  save/_climate_edsr_topo_80x100_topo_minmax_lte_ft_weighted_mae/
+    ├─ config.yaml
+    ├─ log.txt
+    ├─ epoch-last.pth / epoch-{N}.pth
+    ├─ epoch-best-psnr.pth
+    └─ epoch-best-loss.pth
+  --name / --tag 옵션으로 저장 폴더명 변경 가능.
+
+
+======================================================================
+ 5. 튜닝 / 주의사항
+======================================================================
+- w_max 가 이 손실의 핵심 하이퍼파라미터다.
+  * 너무 작으면 일반 MAE 와 비슷해지고 호우 개선 효과가 약하다.
+  * 너무 크면 극값 픽셀 몇 개가 gradient 를 지배해 학습이 불안정해질 수 있다.
+  * 논문 취지대로 "학습자료 강수 분포의 상위 퍼센타일(예: 99th)" 근처에서 시작해
+    50 / 80 / 120 mm/day 정도로 sweep 하며 val 지표(특히 99th percentile 오차,
+    기후값 편차)를 보는 것을 권장.
+- w_min 은 무강수/약한 비 픽셀에 남길 최소 가중치. 0 으로 두면 무강수 픽셀 오차가
+  학습에서 완전히 무시되므로, 0 보다 살짝 큰 값(0.1 mm/day 등)을 권장.
+- normalize_by_weight: true 로 두면 손실이 "가중 평균 |오차(mm)|" 가 되어
+  로그 값이 해석하기 쉽고 스케일이 안정적이다. 대신 논문 Eq.(1) 과는 다른 형태.
+- eval_psnr 의 val loss 는 Weighted MAE 가 아니라 정규화 단순 L1 이므로,
+  파인튜닝 효과(특히 호우)는 별도 추론 후 mm 공간에서
+  RMSE / bias / 퍼센타일별 오차로 평가할 것.
+  (inference_tools 의 케이스 추론 스크립트 재사용 가능; 체크포인트 포맷 동일.)
+- correction layer 는 이 스크립트에서 사용 불가(가드로 막힘). 필요하면 별도 스크립트.
+- (obs_state: true) ASOS 는 지점 관측 vs 모델은 격자 추론이라 대표성 오차가 있고,
+  좌표 정합이 중요하다. wrapper(sr-implicit-paired-ft) 의 위경도 flip 교정
+  (obs_coord[:,0] = -obs_coord[:,0]) 이 반영된 상태여야 한다 (2026-09-07 수정본).
+- (obs_state: true) 초기 몇 배치의 Weighted MAE(mm) 가 수십~200 mm 로 크게 나오는 건
+  정상이다 (사전학습 모델이 그리드로만 학습돼 관측소 값과 편차가 큼). 학습하며 감소.
+- 날짜 key(ASOS)와 IMERG 시간축이 완전히 겹치지 않으면 그 날은 유효 지점 0 -> 배치에서
+  일부 샘플 mask 합이 0 일 수 있다. 스크립트가 처리함(해당 원소 제외/배치 skip).
+
+
+======================================================================
+ 6. 검증한 것 (2026-09-09)
+======================================================================
+- losses_wang2023.weighted_mae / WeightedMAELoss 수치 검증 (수동 계산과 일치).
+- finetune_from 체크포인트 로드 -> add_layer 없음 확인 -> forward OK.
+- (obs_state: false) train 한 배치 forward + Weighted MAE(mm) + backward 통과.
+- (obs_state: true, 전체 config) end-to-end 확인:
+  * make_data_loader + pad_collate -> batch {inp,gt,coord,cell,level,mask}, mask 합이
+    샘플마다 다름(0 포함) 정상 처리.
+  * prepare_training -> [check] add_layer 없음, [freeze] encoder 동결,
+    trainable 1,444,097 / total 39,801,881.
+  * 3개 배치 forward -> mask 인덱싱 -> Weighted MAE(mm) -> backward -> optimizer.step OK.
+  * test.eval_psnr(physical_norm=...) 가 mask 처리 포함하여 정상 동작 (psnr/val L1 반환; loss_type='l1' 로 호출).
+- train_liif_finetune_weighted_mae.py 문법 파싱 OK.
+※ 전체 학습 런은 사용자가 직접 실행.

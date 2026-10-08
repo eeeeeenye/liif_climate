@@ -1,0 +1,119 @@
+================================================================================
+ 확률적 CNP adapter 실험 (얼린 LTE + Conditional Neural Process 보정)
+ 작성: 2026-09-10
+================================================================================
+
+■ 목적
+  사전학습 LTE(_climate_edsr_topo_80x100_topo_minmax_lte)는 그대로 얼리고,
+  ASOS 관측소 잔차를 조건으로 받아 임의 좌표에서 "보정량의 확률분포"를 내는
+  CNP 식 adapter를 새로 학습한다.
+
+      Y0(x)      = LTE(IMERG, x)                      (동결)
+      e_i        = y_i^ASOS - Y0(s_i)
+      context C  = { [coord_i, Y0(s_i), e_i] }        (그 날짜 ASOS 일부)
+      encoder MLP -> r_i -> mean -> r
+      target x_t : [coord_t, Y0(x_t)] ++ r -> decoder MLP -> (mu_t, s_t)
+      sigma_t    = softplus(s_t) + min_sigma
+      p(dy_t|x_t,C) = N(mu_t, sigma_t^2)
+      최종        Y_final(x) = clip(Y0(x) + mu(x), 0)
+      불확실성    sigma(x)
+
+■ 새로 만든 파일 (기존 파일은 하나도 수정하지 않음)
+  - models/cnp_adapter.py
+      register('cnp-adapter') ProbabilisticCNPAdapter.
+      encoder(4->enc_hidden->r_dim), masked-mean 집계, decoder(r_dim+3->dec_hidden->2).
+      decoder 마지막 층 bias = [0, init_sigma_bias] 로 초기화(초기 sigma 축소).
+      LTE 밖에서 감싸는 방식 -> LTE/기존 학습 코드에 영향 없음.
+  - losses_cnp.py
+      gaussian_nll / GaussianNLL / make_loss.
+      L = mean[ 0.5( (dy-mu)^2/sigma^2 + log sigma^2 ) ]  (상수항 생략)
+      beta-NLL(Seitzer 2022) 옵션 args.beta (기본 0 = 순수 NLL).
+  - train_cnp_adapter.py
+      train_liif_finetune_weighted_mae.py 의 pad_collate/loader 재사용.
+      LTE 는 config.lte_from 에서 있는 그대로 생성 후 freeze+eval (no_grad).
+      매 iteration: 그 날짜 유효 ASOS 를 context/target 으로 랜덤 disjoint 분할
+        (ctx_ratio, min_context, min_target). context 만 adapter 에 주고
+        target 잔차와 NLL 비교. batch 내 sample 별 loop(스테이션 ~30개라 저렴).
+      val: 고정 seed 분할. NLL + 보정 RMSE(mm) + rmse_ratio(=adapter/base, <1이면 개선)
+        + coverage_1sigma(|err|<=sigma 비율, 보정+calibration 되면 ~0.68 근처 기대).
+      저장: epoch-last / epoch-{n} / epoch-best-nll / epoch-best-rmse.
+      체크포인트에 lte_from 도 기록.
+  - configs/train_climate/cnp_adapter_lte_minmax.yaml
+      train 1998-2009 (obs 4380), val 2020-2022 (obs 4380). obs_state:true.
+      physical_norm 0~506.02. lr 1e-3, epoch_max 200, loss_space normalized.
+  - inference_tools/infer_cnp_adapter.py
+      ASOS 전 지점 context, 100x80 격자 target.
+      출력 nc: precip_base(Y0) / precip_correction(mu) / precip_uncertainty(sigma)
+              / precip_final / precip_true(GT) + obs_lat/lon/val, 전부 mm/day.
+      quicklook.png: 날짜 x [base, mu, sigma, final, GT, final-GT] + ASOS 점 overlay.
+      좌표/정규화/ cell(2/1000) 레시피는 save/.../infer_cases.py 와 일치.
+      ASOS 좌표는 wrapper 와 동일하게 y 부호 반전(위경도 flip 버그 교정).
+
+■ 실행
+  학습:
+    python train_cnp_adapter.py \
+      --config configs/train_climate/cnp_adapter_lte_minmax.yaml --gpu 2
+  추론:
+    python inference_tools/infer_cnp_adapter.py \
+      --adapter_ckpt save/_cnp_adapter_lte_minmax/epoch-best-nll.pth \
+      --dates 2020-08-01 2021-08-31 --gpu 2
+  env: /home/inhye_yoo/anaconda3/envs/liif/bin/python
+
+■ 스모크 테스트 (2026-09-10, GPU2)
+  train NLL -2.06 -> -2.12 (4 batch), val 통과. adapter 파라미터 83,842.
+  초기 상태 rmse_ratio~1.00 / coverage_1sigma~0.99 (sigma 초기 과대 -> 학습으로 축소 예상).
+
+■ 좌표/스케일 메모
+  - wrapper(sr-implicit-paired-ft, obs_state:true) 가 obs_coord[:,0] = -obs_coord[:,0]
+    로 flip 교정. ObsInMemory 는 gt 를 meta(0~506.02) minmax 정규화.
+  - Y0, gt, e, mu, sigma 는 학습 내내 [0,1] minmax 공간. mm/day 는 * 506.02.
+  - context/target cell 모두 2/1000 (wrapper 의 ASOS cell 과 동일). inference 도 동일.
+  - 잔차 e 는 encoder 입력 feature 로만 쓰이고, decoder target 입력엔 안 들어감(정보 누설 방지).
+
+■ CNP 1차 결과 (epoch ~18, 2026-09-10)
+  - val rmse_ratio(adapter/base 잔차 RMSE): ep1 1.11 -> ep13 0.917 -> ep18 0.91 에서 정체.
+    즉 held-out 관측소 잔차를 ~8~9% 감소시키고 plateau.
+  - correction mu: 모든 호우일에서 "강수 코어(관측소 밀집) 음수(-15~-25mm) + 건조역 약양수" =
+    IMERG 극값 과대를 ASOS 쪽으로 눌러줌 (방향 맞음, lr_collapse/flip 노트와 일치).
+  - final-GT(IMERG) MAE 2->12mm 증가는 설계대로(IMERG 이탈). IMERG 를 잣대로 쓰면 안 됨.
+  - sigma 과대(~25~35mm)·뭉툭. cov1sig 0.47~0.98 로 튐(calibration 미흡).
+  - 원인: mean aggregation -> 모든 target 이 같은 r -> 국소성 없음 (전역 회귀에 가까움).
+  인퍼런스: inference_tools/infer_cnp_adapter.py, 출력 save/_cnp_adapter_lte_minmax/preds_cnp/.
+
+■ ANP(attention) 버전 추가 (2026-09-10)
+  - models/anp_adapter.py  register('anp-adapter') AttentiveCNPAdapter.
+      value v_i=f_v([coord,Y0,e]) / key k_i=f_k([coord,Y0]) / query q_t=f_q([coord,Y0])
+      -> nn.MultiheadAttention(q,k,v) -> target 별 r*_t (+ use_global 이면 mean(v_i) concat)
+      -> decoder([coord_t, Y0_t, r*_t (, r_mean)]) -> (mu, sigma).
+      forward(context, target, ctx_mask) 인터페이스는 cnp-adapter 와 동일.
+  - train_anp_adapter.py  = train_cnp_adapter.py + anp 모듈 import (모델 무관 코드라 그대로).
+  - configs/train_climate/anp_adapter_lte_minmax.yaml  (model 만 anp-adapter, r_dim 128 / n_heads 4).
+  - inference_tools/infer_prob_adapter.py  = infer_cnp_adapter.py + anp import, 출력 preds_prob/.
+  실행: python train_anp_adapter.py --config configs/train_climate/anp_adapter_lte_minmax.yaml --gpu 2
+  추론: python inference_tools/infer_prob_adapter.py --adapter_ckpt save/_anp_adapter_lte_minmax/epoch-best-nll.pth --dates ... --gpu 2
+  스모크(2026-09-10, GPU2): anp 200,322 params, 12배치 학습에서 train nll -2.10->-2.22, 크래시 없음.
+
+■ ANP 결과 (epoch ~20, 2026-09-10)
+  - metric 은 CNP 추월: val rmse_ratio ep14 0.911 -> ep20 0.865 (CNP 는 ~0.90 정체).
+  - 그러나 인퍼런스 맵이 폭주: 관측소 구름 밖(코너/해상/북한)에 +60~147mm blob,
+    대각선 Voronoi 쐐기 아티팩트. 2020-07-23 final MAE 48.9mm.
+  - 원인: 절대좌표 attention 이 먼 target 을 "임베딩상 가까운 관측소 1개" 에 몰빵 + 극단 외삽.
+    val 이 held-out 관측소(전부 구름 안)만 재서 이 환각을 못 잡음 -> ratio 0.865 는 착시.
+
+■ GNP(거리 게이트) 버전 추가 (2026-09-10) — ANP 폭주 대응
+  - models/gnp_adapter.py  register('gnp-adapter') GatedNPAdapter. 손수 구현한 multihead attention에
+      (1) 거리 게이트: logit += -||coord_t-coord_i||^2 / (2*ell_h^2), ell_h = head별 학습 length scale
+      (2) null token: 거리페널티 없는 학습 (k,v) 1쌍 -> 관측소 다 멀면 softmax가 여기로 -> prior(보정0) 폴백
+      (3) density feature: log(1+sum exp(-d^2/2ell^2)) 를 decoder 입력에 concat
+  - train_gnp_adapter.py / configs/train_climate/gnp_adapter_lte_minmax.yaml
+      (length_scale_init 0.3 = LIIF 좌표 도메인폭 2의 15% ~ 위도 1.5도)
+  - infer_prob_adapter.py 에 gnp import 추가 (cnp/anp/gnp 다 이 스크립트로 추론).
+  - 스모크(2026-09-10, GPU2): gnp 134,790 params. 24배치 학습 상태에서
+      mu*506 in-hull [0.1,1.4] / out-of-hull [-0.3,3.9] mm (ANP 는 out +147 폭주였음 -> 해결),
+      sigma out-of-hull mean 42 > in-hull 34 mm (데이터 희박한 곳 불확실성 증가, 방향 맞음).
+  실행: python train_gnp_adapter.py --config configs/train_climate/gnp_adapter_lte_minmax.yaml --gpu 2
+
+■ 남은 아이디어
+  1) decoder target 입력에 LTE encoder feature F_LIIF(x_t) concat.
+  2) beta-NLL(beta 0.5) 로 분산추정 안정화, 또는 loss_space physical 로 mm 단위 학습.
+  3) val 지표에 "관측소 구름 밖 |mu| 폭주" 페널티/모니터 추가 (ANP 착시 방지).
